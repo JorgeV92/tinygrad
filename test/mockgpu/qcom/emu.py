@@ -133,3 +133,30 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
     
     raise NotImplementedError(f"IR3 category {cat} at pc {pc}")
 
+def decode_program(code: bytes[bytearray[memoryview]]) -> tuple[IR3Instruction, ...]:
+    data = memoryview(code).cast("B")
+    if data.nbytes & 7: raise ValueError("IR3 code size must be a mult of 8")
+    ret = []
+    for i in range(0, data.nbytes, 8):
+        ret.append(decode_instruction(int.from_bytes(data[i:i+8], "little"), i/8))
+        if ret[-1].opcode == "end": break
+    return tuple(ret)
+
+def _typed_value(x: int, typ: int):
+    if typ == TYPE_F16: return struct.unpack("<e", struct.pack("<H", x & MASK16))[0]
+    if typ == TYPE_F32: return _f32(x)
+    if typ == TYPE_U16: return x & MASK16
+    if typ == TYPE_U32: return x & MASK32
+    if typ == TYPE_S16: return _sext(x & MASK16, 16)
+    if typ == TYPE_S32: return _s32(x)
+    if typ == TYPE_U8: return x & 0xff
+    if typ == TYPE_S8: return _sext(x & 0xff, 8)
+    raise ValueError(typ)
+
+def _typed_bits(x, typ: int) -> int:
+    if typ == TYPE_F16: return struct.unpack("<H", struct.pack("<e", float(x)))[0]
+    if typ == TYPE_F32: return _f32bits(float(x))
+    bits = 16 if typ in (TYPE_U16, TYPE_S16) else 8 if type in (TYPE_U8, TYPE_S8) else 32
+    return int(x) & ((1<<bits)-1)
+
+
