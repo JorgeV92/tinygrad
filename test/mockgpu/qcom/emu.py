@@ -159,4 +159,75 @@ def _typed_bits(x, typ: int) -> int:
     bits = 16 if typ in (TYPE_U16, TYPE_S16) else 8 if type in (TYPE_U8, TYPE_S8) else 32
     return int(x) & ((1<<bits)-1)
 
+class IR3Machine:
+    def __int__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview={}, 
+                translate_addr: Callable[[int], int]|None=None):
+        self.program, self.regs, self.hregs = tuple(program), [0]*256, [0]*256
+        if isinstance(constants, (bytes, bytearray, memoryview)):
+            mv = memoryview(constants).cast("B")
+            if mv.nbytes & 3: raise ValueError("IR3 constant data must be 4-byte aligned")
+            self.constants = list(mv.cast("I"))
+        else: self.constants = [_u32(x) for x in constants]
+        # TODO use qcomgpu.py mapped-range bookkeeping
+        self.translate_addr = translate_addr or (lambda x: x)
+        self.pc, self.done = 0, False 
+
+    def _read(self, op: IR3Operand) -> int:
+        # read an operand as raw integer bits
+        if op.kind == "imm": return _u32(op.imm)
+        if op.kind == "const":
+            if op.num >= len(self.constants): raise RuntimeError(f"constants c{op.num/4}.{('x','y','z','w')[op.num&3]} out of bounds")
+            return self.constants[op.num] & (MASK16 if op.half else MASK32)
+        if op.kind == "gpr": return (self.hregs if op.half else self.regs)[op.num] & (MASK16 if op.half else MASK32)
+        raise ValueError(op.kind)
+    
+    def _write(self, op: IR3Operand, val: int):
+        # write raw bits to a full or half GPR 
+        if op.kind != "gpr": raise RuntimeError(f"cannot write {op.kind}")
+        (self.hregs if op.half else self.regs)[op.num] = val & (MASK16 if op.half else MASK32)
+
+    def _addr(self, op: IR3Operand, off=0) -> int:
+        # a 64-bit global address from two consecutive full GPR slots
+        if op.kind != "gpr" or op.half or op.num == 255: raise RuntimeError(f"invalid 64-bit address reg {op}")
+        return ((self.regs[op.num+1] << 32) | self.regs[op.num]) + off 
+
+    def _load_u32(self, addr: int) -> int:
+        return int(to_mv(self.translate_addr(addr), 4).cast("B").cast("I"))[0]
+
+    def _store_u32(self, addr: int, val: int):
+        to_mv(self.translate_addr(addr), 4).cast("B").cast("I")[0] = val & MASK32
+
+    def step(self):
+        # execute one decoded instruction 
+        if self.done: return
+        if not 0 <= self.pc < len(self.program): raise RuntimeError(f"IR3 pc out of range: {self.pc}")
+        inst = self.program[self.pc]
+        if inst.repeat and inst.opcode != "nop": raise NotImplementedError(f"IR3 repeat on {inst.opcode}")
+
+        if inst.opcode == "nop":
+            pass
+        elif inst.opcode == "end":
+            self.done = True
+        elif inst.opcode.startswith(("mov.", "cov.")):
+            val = _typed_value(self._read(inst.srcs[0]), inst.src_type)
+            self._write(inst.dst, _typed_bits(val, inst.dst_type))
+        elif inst.opcode == "add.u":
+            self._write(inst.dst, self._read(inst.srcs[0]) + self._read(inst.srcs[1]))
+        elif inst.opcode == "shl.b":
+            self._write(inst.dst, self._read(inst.srcs[0]) << (self._read(inst.srcs[1]) & 31))
+        elif inst.opcode == "ashr.b":
+            self._write(inst.dst, _s32(self._read(inst.srcs[0])) >> (self._read(inst.srcs[1]) & 31)) 
+        elif inst.opcode == "shrg":
+            s1, s2, s3 = (self._read(x) for x in inst.srcs)
+            self._write(inst.dst, (s2 >> (s1 & 31)) | s3)
+        elif inst.opcode == "cmps.u":
+            a, b = self._read(inst.srcs[0]), self._read(inst.srcs[1])
+            conds = (a < b, a <= b, a > b, a >= b, a == b, a != b)
+            if inst.condition >= len(conds): raise NotImplementedError(f"IR3 compare condition {inst.condition}")
+            self._write(inst.dst, int(conds[inst.condition]))
+        elif inst.opcode == "ldg.u32":
+            self._write(inst.dst, self._load_u32(self._addr(inst.srcs[0], _s32(self._read(inst.srcs[1])))))
+        
+            
+
 
