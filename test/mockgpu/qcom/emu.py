@@ -61,13 +61,13 @@ def _decode_cat3_src(x: int, half: bool, immed: bool) -> IR3Operand:
 
 def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
     cat = raw >> 61 
-    # cat0: flow/control 
+    # cat0: flow/control nop, end, branches, kill
     if cat == 0:
         opc, repeat = _bits(raw, 55, 58), _bits(raw, 40, 42)
         if opc == 0: return IR3Instruction(pc, raw, "nop", repeat=repeat)
         if opc == 6: return IR3Instruction(pc, raw, "end")
         raise NotImplementedError(f"IR3 cat0 opcode {opc:#x} at pc {pc}")
-    # cat1 move and scalar conversions
+    # cat1 move / conversion mov, type conversion
     if cat == 1:
         src_type, dst_type, mode = _bits(raw, 50, 52), _bits(raw, 46, 48), _bits(raw, 53, 54)
         if _bits(raw, 49, 49): raise NotImplementedError("relative cat1 destination")
@@ -82,4 +82,54 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
         op = "mov" if src_type == dst_type else "cov"
         return IR3Instruction(pc, raw, f"{op}.{TYPE_NAMES[src_type]}{TYPE_NAMES[dst_type]}", dst, (src,),
                                   src_type=src_type, dst_type=dst_type, repeat=_bits(raw, 40, 41))
-    # TODO: add more 
+    # cat2 normal 2-source ALU add.f, add.u, mul, cmps, shifts 
+    if cat == 2:
+        opcs = {0: "add.f", 16: "add.u", 20: "comps.u", 54: "shlb.b", 56: "ashr.b"}
+        opc = _bits(raw, 53, 58)
+        if opc not in opcs: raise NotImplementedError(f"IR3 cat2 opcode {opc:#x} at pc {pc}")
+        full, dst_conv = bool(_bits(raw, 52,52)), bool(_bits(raw, 46, 46))
+        half = not full 
+        dst_num = _bits(raw, 32, 39)
+        dst_half = full == dst_conv and dst_num <= 0xf7
+        repeat = _bits(raw, 40, 41)
+        src1_r, src2_r = _bits(raw, 43,43), _bits(raw,51,51)
+        nop_count = (src1_r | (src2_r << 1)) if repeat == 0 else 0
+        src1, src2 = _decode_multisrc(_bits(raw, 0,15), half), _decode_multisrc(_bits(raw, 16, 31), half)
+        return IR3Instruction(pc, raw, opcs[opc], _gpr(dst_num, dst_half), (src1, src2), 
+                              condition=_bits(raw, 48,50), repeat=repeat, nop_count=nop_count)
+    # cat3: 3-source ALU mad, select, shrg
+    if cat == 3:
+        opc = _bits(raw, 55, 58)
+        if _bits(raw, 13, 13) != 1 or opc != 10: raise NotImplementedError(f"IR3 cat3 opcode {opc:#x} at pc {pc}")
+        if _bits(raw, 14,14) or _bits(raw,30,31): raise NotImplementedError("cat3 source negation")
+        full, dst_conv = bool(_bits(raw,42,42)), bool(_bits(raw,46,46))
+        half = not full 
+        dst_num = _bits(raw, 32, 39)
+        dst_half = full == dst_conv and dst_num <= 0xf7
+        src1 = _decode_cat3_src(_bits(raw,0,12), half, True) 
+        src2 = _gpr(_bits(raw, 47, 54), half)
+        src3 = _decode_cat3_src(_bits(raw, 16,28), half, True)
+        repeat = _bits(raw, 40,41)
+        src1_r, src2_r = _bits(raw, 43,43), _bits(raw, 15,15)
+        nop_count = (src1_r | (src2_r << 1)) if repeat == 0 else 0
+        return IR3Instruction(pc, raw, "shrg", _gpr(dst_num, dst_half), (src1, src2, src3), repeat=repeat, nop_count=nop_count)
+    
+    # TODO: work on cat4,cat5/cat7
+
+    # cat6: memory load, store, atomics 
+    if cat == 6:
+        opc, typ, size = _bits(raw, 54,58), _bits(raw, 49,51), _bits(24,31)
+        if typ != TYPE_U32 or size != 1: raise NotImplementedError(f"IR3 cat6 type/size {TYPE_NAMES[typ]}/{size}")
+        if opc == 0:
+            if _bits(raw,22,22): raise NotImplementedError(f"idg.a")
+            src, dst = _gpr(_bits(raw,14,21)), _gpr(_bits(raw,32,39))
+            return IR3Instruction(pc, raw, "ldg.u32", dst, (src, _imm(_sext(_bits(raw,1,13), 13))))
+        if opc == 3:
+            if _bits(raw,52,52): raise NotImplementedError("stg.a")
+            off = _sext((_bits(raw, 9,13) << 8) | _bits(raw, 32,39), 13)
+            addr, val = _gpr(_bits(raw,41,48)), _gpr(_bits(raw,1,8))
+            return IR3Instruction(pc, raw, "stg.u32", None, (addr, _imm(off), val))
+        raise NotImplementedError(f"IR3 cat6 opcode {opc:#x} at pc {pc}")
+    
+    raise NotImplementedError(f"IR3 category {cat} at pc {pc}")
+
