@@ -28,3 +28,58 @@ class IR3Operand:
         pfx = ("hc" if self.half else "c") if self.kind == "const" else "hr" if self.half else "r"
         return f"{pfx}{self.num/4}.{('x','y','x','w')[self.num&3]}"
 
+@dataclass(frozen=True)
+class IR3Instruction:
+    pc: int
+    raw: int
+    opcode: str 
+    dst: IR3Operand | None = None 
+    srcs: tuple[IR3Operand, ...] = ()
+    condition: int = 0
+    src_type: int = -1
+    dst_type: int = -1 
+    repeat: int = 0 
+    nop_count: int  = 0
+
+
+def _gpr(num: int, half = False) -> IR3Operand: return IR3Operand("gpr", num=num, half=half)
+def _const(num: int, half=False) -> IR3Operand: return IR3Operand("const", num=num, half=half)
+def _imm(val: int) -> IR3Operand: return IR3Operand("imm", imm=val)
+
+def _decode_multisrc(x: int, half: bool) -> IR3Operand:
+    mod, mode = _bits(x, 14, 15), _bits(x, 11, 13)
+    if mod: raise NotImplementedError(f"IR3 source modifier {mod} is not supprted")
+    if mode == 0: return _gpr(x & 0xff, half)
+    if mode in (2, 6): return _const(x & 0x7ff, half)
+    if mode == 4: return _imm(_sext(x & 0x7ff, 11))
+    raise NotImplementedError(f"IR3 multisrc encoding {mode} is not supprted")
+
+def _decode_cat3_src(x: int, half: bool, immed: bool) -> IR3Operand:
+    if immed and (x & 0x1000): return _imm(x & 0xfff)
+    if _bits(x, 8, 12) == 0: return _gpr(x & 0xff, half)
+    raise NotImplementedError(f"IR3 cat3 source encoding {x:#x} is not supported")
+
+def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
+    cat = raw >> 61 
+    # cat0: flow/control 
+    if cat == 0:
+        opc, repeat = _bits(raw, 55, 58), _bits(raw, 40, 42)
+        if opc == 0: return IR3Instruction(pc, raw, "nop", repeat=repeat)
+        if opc == 6: return IR3Instruction(pc, raw, "end")
+        raise NotImplementedError(f"IR3 cat0 opcode {opc:#x} at pc {pc}")
+    # cat1 move and scalar conversions
+    if cat == 1:
+        src_type, dst_type, mode = _bits(raw, 50, 52), _bits(raw, 46, 48), _bits(raw, 53, 54)
+        if _bits(raw, 49, 49): raise NotImplementedError("relative cat1 destination")
+        half = src_type in HALF_TYPES
+        if mode == 0:
+            if raw & 0xffffff00: raise NotImplementedError("relative/extended cat1 gpr source")
+            src = _gpr(raw & 0xff, half)
+        elif mode == 1: src = _const(raw & 0x7ff, half)
+        elif mode == 2: src = _imm(raw & MASK32)
+        else: raise NotImplementedError(f"IR3 cat1 source mode {mode}")
+        dst = _gpr(_bits(raw, 32, 39), dst_type in HALF_TYPES)
+        op = "mov" if src_type == dst_type else "cov"
+        return IR3Instruction(pc, raw, f"{op}.{TYPE_NAMES[src_type]}{TYPE_NAMES[dst_type]}", dst, (src,),
+                                  src_type=src_type, dst_type=dst_type, repeat=_bits(raw, 40, 41))
+    # TODO: add more 
