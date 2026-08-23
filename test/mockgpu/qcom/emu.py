@@ -9,12 +9,12 @@ TYPE_F16, TYPE_F32, TYPE_U16, TYPE_U32, TYPE_S16, TYPE_S32, TYPE_U8, TYPE_S8 = r
 TYPE_NAMES = ("f16", "f32", "u16", "u32", "s16", "s32", "u8", "s8")
 HALF_TYPES = {TYPE_F16, TYPE_U16, TYPE_S16, TYPE_U8, TYPE_S8}
 
-def _bits(x: int, lo: int, hi: int) -> int: return (x >> 10) & ((1 << (hi-lo+1)) - 1)
+def _bits(x: int, lo: int, hi: int) -> int: return (x >> lo) & ((1 << (hi-lo+1)) - 1)
 def _sext(x: int, bits: int) -> int: return x - (1 << bits) if x & (1 << (bits-1)) else x
-def _u32(x: int) -> int: return x & MASK32 
+def _u32(x: int) -> int: return x & MASK32
 def _s32(x: int) -> int: return _sext(x & MASK32, 32)
 def _f32(x: int) -> float: return struct.unpack("<f", struct.pack("<I", x & MASK32))[0]
-def _f32bits(x: float) -> int: return struct.unpack("<I", struct.pack("<f", x))[0] 
+def _f32bits(x: float) -> int: return struct.unpack("<I", struct.pack("<f", x))[0]
 
 @dataclass(frozen=True)
 class IR3Operand:
@@ -24,21 +24,21 @@ class IR3Operand:
     half: bool = False
 
     def __str__(self):
-        if self.kind == "imm": return str(self.imm) 
+        if self.kind == "imm": return str(self.imm)
         pfx = ("hc" if self.half else "c") if self.kind == "const" else "hr" if self.half else "r"
-        return f"{pfx}{self.num/4}.{('x','y','x','w')[self.num&3]}"
+        return f"{pfx}{self.num//4}.{('x','y','z','w')[self.num&3]}"
 
 @dataclass(frozen=True)
 class IR3Instruction:
     pc: int
     raw: int
-    opcode: str 
-    dst: IR3Operand | None = None 
+    opcode: str
+    dst: IR3Operand | None = None
     srcs: tuple[IR3Operand, ...] = ()
     condition: int = 0
     src_type: int = -1
-    dst_type: int = -1 
-    repeat: int = 0 
+    dst_type: int = -1
+    repeat: int = 0
     nop_count: int  = 0
 
 
@@ -60,7 +60,7 @@ def _decode_cat3_src(x: int, half: bool, immed: bool) -> IR3Operand:
     raise NotImplementedError(f"IR3 cat3 source encoding {x:#x} is not supported")
 
 def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
-    cat = raw >> 61 
+    cat = raw >> 61
     # cat0: flow/control nop, end, branches, kill
     if cat == 0:
         opc, repeat = _bits(raw, 55, 58), _bits(raw, 40, 42)
@@ -82,20 +82,20 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
         op = "mov" if src_type == dst_type else "cov"
         return IR3Instruction(pc, raw, f"{op}.{TYPE_NAMES[src_type]}{TYPE_NAMES[dst_type]}", dst, (src,),
                                   src_type=src_type, dst_type=dst_type, repeat=_bits(raw, 40, 41))
-    # cat2 normal 2-source ALU add.f, add.u, mul, cmps, shifts 
+    # cat2 normal 2-source ALU add.f, add.u, mul, cmps, shifts
     if cat == 2:
-        opcs = {0: "add.f", 16: "add.u", 20: "comps.u", 54: "shlb.b", 56: "ashr.b"}
+        opcs = {0: "add.f", 16: "add.u", 20: "cmps.u", 54: "shl.b", 56: "ashr.b"}
         opc = _bits(raw, 53, 58)
         if opc not in opcs: raise NotImplementedError(f"IR3 cat2 opcode {opc:#x} at pc {pc}")
         full, dst_conv = bool(_bits(raw, 52,52)), bool(_bits(raw, 46, 46))
-        half = not full 
+        half = not full
         dst_num = _bits(raw, 32, 39)
         dst_half = full == dst_conv and dst_num <= 0xf7
         repeat = _bits(raw, 40, 41)
         src1_r, src2_r = _bits(raw, 43,43), _bits(raw,51,51)
         nop_count = (src1_r | (src2_r << 1)) if repeat == 0 else 0
         src1, src2 = _decode_multisrc(_bits(raw, 0,15), half), _decode_multisrc(_bits(raw, 16, 31), half)
-        return IR3Instruction(pc, raw, opcs[opc], _gpr(dst_num, dst_half), (src1, src2), 
+        return IR3Instruction(pc, raw, opcs[opc], _gpr(dst_num, dst_half), (src1, src2),
                               condition=_bits(raw, 48,50), repeat=repeat, nop_count=nop_count)
     # cat3: 3-source ALU mad, select, shrg
     if cat == 3:
@@ -103,25 +103,25 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
         if _bits(raw, 13, 13) != 1 or opc != 10: raise NotImplementedError(f"IR3 cat3 opcode {opc:#x} at pc {pc}")
         if _bits(raw, 14,14) or _bits(raw,30,31): raise NotImplementedError("cat3 source negation")
         full, dst_conv = bool(_bits(raw,42,42)), bool(_bits(raw,46,46))
-        half = not full 
+        half = not full
         dst_num = _bits(raw, 32, 39)
         dst_half = full == dst_conv and dst_num <= 0xf7
-        src1 = _decode_cat3_src(_bits(raw,0,12), half, True) 
+        src1 = _decode_cat3_src(_bits(raw,0,12), half, True)
         src2 = _gpr(_bits(raw, 47, 54), half)
         src3 = _decode_cat3_src(_bits(raw, 16,28), half, True)
         repeat = _bits(raw, 40,41)
         src1_r, src2_r = _bits(raw, 43,43), _bits(raw, 15,15)
         nop_count = (src1_r | (src2_r << 1)) if repeat == 0 else 0
         return IR3Instruction(pc, raw, "shrg", _gpr(dst_num, dst_half), (src1, src2, src3), repeat=repeat, nop_count=nop_count)
-    
+
     # TODO: work on cat4,cat5/cat7
 
-    # cat6: memory load, store, atomics 
+    # cat6: memory load, store, atomics
     if cat == 6:
-        opc, typ, size = _bits(raw, 54,58), _bits(raw, 49,51), _bits(24,31)
+        opc, typ, size = _bits(raw, 54,58), _bits(raw, 49,51), _bits(raw, 24,31)
         if typ != TYPE_U32 or size != 1: raise NotImplementedError(f"IR3 cat6 type/size {TYPE_NAMES[typ]}/{size}")
         if opc == 0:
-            if _bits(raw,22,22): raise NotImplementedError(f"idg.a")
+            if _bits(raw,22,22): raise NotImplementedError("ldg.a")
             src, dst = _gpr(_bits(raw,14,21)), _gpr(_bits(raw,32,39))
             return IR3Instruction(pc, raw, "ldg.u32", dst, (src, _imm(_sext(_bits(raw,1,13), 13))))
         if opc == 3:
@@ -130,15 +130,15 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
             addr, val = _gpr(_bits(raw,41,48)), _gpr(_bits(raw,1,8))
             return IR3Instruction(pc, raw, "stg.u32", None, (addr, _imm(off), val))
         raise NotImplementedError(f"IR3 cat6 opcode {opc:#x} at pc {pc}")
-    
+
     raise NotImplementedError(f"IR3 category {cat} at pc {pc}")
 
-def decode_program(code: bytes[bytearray[memoryview]]) -> tuple[IR3Instruction, ...]:
+def decode_program(code: bytes|bytearray|memoryview) -> tuple[IR3Instruction, ...]:
     data = memoryview(code).cast("B")
-    if data.nbytes & 7: raise ValueError("IR3 code size must be a mult of 8")
+    if data.nbytes & 7: raise ValueError("IR3 code size must be a multiple of 8")
     ret = []
     for i in range(0, data.nbytes, 8):
-        ret.append(decode_instruction(int.from_bytes(data[i:i+8], "little"), i/8))
+        ret.append(decode_instruction(int.from_bytes(data[i:i+8], "little"), i//8))
         if ret[-1].opcode == "end": break
     return tuple(ret)
 
@@ -156,11 +156,11 @@ def _typed_value(x: int, typ: int):
 def _typed_bits(x, typ: int) -> int:
     if typ == TYPE_F16: return struct.unpack("<H", struct.pack("<e", float(x)))[0]
     if typ == TYPE_F32: return _f32bits(float(x))
-    bits = 16 if typ in (TYPE_U16, TYPE_S16) else 8 if type in (TYPE_U8, TYPE_S8) else 32
+    bits = 16 if typ in (TYPE_U16, TYPE_S16) else 8 if typ in (TYPE_U8, TYPE_S8) else 32
     return int(x) & ((1<<bits)-1)
 
 class IR3Machine:
-    def __int__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(), 
+    def __init__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(),
                 translate_addr: Callable[[int], int]|None=None):
         self.program, self.regs, self.hregs = tuple(program), [0]*256, [0]*256
         if isinstance(constants, (bytes, bytearray, memoryview)):
@@ -170,35 +170,35 @@ class IR3Machine:
         else: self.constants = [_u32(x) for x in constants]
         # TODO use qcomgpu.py mapped-range bookkeeping
         self.translate_addr = translate_addr or (lambda x: x)
-        self.pc, self.done = 0, False 
+        self.pc, self.done = 0, False
 
     def _read(self, op: IR3Operand) -> int:
         # read an operand as raw integer bits
         if op.kind == "imm": return _u32(op.imm)
         if op.kind == "const":
-            if op.num >= len(self.constants): raise RuntimeError(f"constants c{op.num/4}.{('x','y','z','w')[op.num&3]} out of bounds")
+            if op.num >= len(self.constants): raise RuntimeError(f"constant c{op.num//4}.{('x','y','z','w')[op.num&3]} out of bounds")
             return self.constants[op.num] & (MASK16 if op.half else MASK32)
         if op.kind == "gpr": return (self.hregs if op.half else self.regs)[op.num] & (MASK16 if op.half else MASK32)
         raise ValueError(op.kind)
-    
-    def _write(self, op: IR3Operand, val: int):
-        # write raw bits to a full or half GPR 
-        if op.kind != "gpr": raise RuntimeError(f"cannot write {op.kind}")
+
+    def _write(self, op: IR3Operand|None, val: int):
+        # write raw bits to a full or half GPR
+        if op is None or op.kind != "gpr": raise RuntimeError(f"cannot write {op.kind if op is not None else None}")
         (self.hregs if op.half else self.regs)[op.num] = val & (MASK16 if op.half else MASK32)
 
     def _addr(self, op: IR3Operand, off=0) -> int:
         # a 64-bit global address from two consecutive full GPR slots
         if op.kind != "gpr" or op.half or op.num == 255: raise RuntimeError(f"invalid 64-bit address reg {op}")
-        return ((self.regs[op.num+1] << 32) | self.regs[op.num]) + off 
+        return ((self.regs[op.num+1] << 32) | self.regs[op.num]) + off
 
     def _load_u32(self, addr: int) -> int:
-        return int(to_mv(self.translate_addr(addr), 4).cast("B").cast("I"))[0]
+        return int(to_mv(self.translate_addr(addr), 4).cast("B").cast("I")[0])
 
     def _store_u32(self, addr: int, val: int):
         to_mv(self.translate_addr(addr), 4).cast("B").cast("I")[0] = val & MASK32
 
     def step(self):
-        # execute one decoded instruction 
+        # execute one decoded instruction
         if self.done: return
         if not 0 <= self.pc < len(self.program): raise RuntimeError(f"IR3 pc out of range: {self.pc}")
         inst = self.program[self.pc]
@@ -216,7 +216,7 @@ class IR3Machine:
         elif inst.opcode == "shl.b":
             self._write(inst.dst, self._read(inst.srcs[0]) << (self._read(inst.srcs[1]) & 31))
         elif inst.opcode == "ashr.b":
-            self._write(inst.dst, _s32(self._read(inst.srcs[0])) >> (self._read(inst.srcs[1]) & 31)) 
+            self._write(inst.dst, _s32(self._read(inst.srcs[0])) >> (self._read(inst.srcs[1]) & 31))
         elif inst.opcode == "shrg":
             s1, s2, s3 = (self._read(x) for x in inst.srcs)
             self._write(inst.dst, (s2 >> (s1 & 31)) | s3)
@@ -232,46 +232,44 @@ class IR3Machine:
         elif inst.opcode == "stg.u32":
             self._store_u32(self._addr(inst.srcs[0], _s32(self._read(inst.srcs[1]))), self._read(inst.srcs[2]))
         else:
-            # TODO: test for other instructions 
+            # TODO: test for other instructions
             raise NotImplementedError(f"IR3 instruction {inst.opcode} at pc {inst.pc}")
 
         # TODO: branches not implemented yet
         self.pc += 1
 
-    def run(self) :
+    def run(self):
         while not self.done: self.step()
 
-    def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|bytearray|memoryview=(), 
-                global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
-                workgroup_id_const: int|None=None, translate_addr: Callable[[int], int]|None=None,
-                init: Callable[[IR3Machine, tuple[int,int,int], tuple[int,int,int], tuple[int,int,int]], None]|None=None):
-        program = decode_program(code)
-        if any(g <= 0 for g in global_size) or any (l <= 0 for l in local_size): raise ValueError("IR3 launch sizes must be positive")
-        if any(g % l for g, l in zip(global_size, local_size)): raise ValueError("global_size must ne div by local_size")
+def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|bytearray|memoryview=(),
+            global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
+            workgroup_id_const: int|None=None, translate_addr: Callable[[int], int]|None=None,
+            init: Callable[[IR3Machine, tuple[int,int,int], tuple[int,int,int], tuple[int,int,int]], None]|None=None):
+    program = decode_program(code)
+    if any(g <= 0 for g in global_size) or any (l <= 0 for l in local_size): raise ValueError("IR3 launch sizes must be positive")
+    if any(g % l for g, l in zip(global_size, local_size)): raise ValueError("global_size must be divisible by local_size")
 
-        # TODO simple serial execution with no cross-invocation state.
-        # adjust after initial version 
-        for z in range(global_size[2]):
-            for y in range(global_size[1]):
-                for x in range(global_size[0]):
-                    gid , lid = (x,y,z), (x%local_size[0], y%local_size[1], z%local_size[2])
-                    wgid = (x//local_size[0], y//local_size[1], z//local_size[2])
-                    machine = IR3Machine(program, constants, translate_addr)
+    # TODO simple serial execution with no cross-invocation state.
+    # adjust after initial version
+    for z in range(global_size[2]):
+        for y in range(global_size[1]):
+            for x in range(global_size[0]):
+                gid, lid = (x,y,z), (x%local_size[0], y%local_size[1], z%local_size[2])
+                wgid = (x//local_size[0], y//local_size[1], z//local_size[2])
+                machine = IR3Machine(program, constants, translate_addr)
 
-                    # TODO: IR3 compiler chooses physical regis for special inputs
-                    # the QCOMProgram will pass those regis here
-                    if local_id_reg is not None: 
-                        for i, v in enumerate(lid): machine.regs[local_id_reg+i]  = v
+                # TODO: IR3 compiler chooses physical regis for special inputs
+                # the QCOMProgram will pass those regis here
+                if local_id_reg is not None:
+                    for i, v in enumerate(lid): machine.regs[local_id_reg+i]  = v
 
-                    if workgroup_id_const is not None:
-                        need = workgroup_id_const + 3
-                        if len(machine.constants) < need: machine.constants += [0] * (need-len(machine.constants))
-                        machine.constants[workgroup_id_const:need] = wgid
-                    if init is not None: init(machine, gid, lid, wgid)
-                    machine.run()
+                if workgroup_id_const is not None:
+                    need = workgroup_id_const + 3
+                    if len(machine.constants) < need: machine.constants += [0] * (need-len(machine.constants))
+                    machine.constants[workgroup_id_const:need] = wgid
+                if init is not None: init(machine, gid, lid, wgid)
+                machine.run()
 
-        
-        
-            
+
 
 
