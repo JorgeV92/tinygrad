@@ -160,7 +160,7 @@ def _typed_bits(x, typ: int) -> int:
     return int(x) & ((1<<bits)-1)
 
 class IR3Machine:
-    def __int__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview={}, 
+    def __int__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(), 
                 translate_addr: Callable[[int], int]|None=None):
         self.program, self.regs, self.hregs = tuple(program), [0]*256, [0]*256
         if isinstance(constants, (bytes, bytearray, memoryview)):
@@ -227,6 +227,50 @@ class IR3Machine:
             self._write(inst.dst, int(conds[inst.condition]))
         elif inst.opcode == "ldg.u32":
             self._write(inst.dst, self._load_u32(self._addr(inst.srcs[0], _s32(self._read(inst.srcs[1])))))
+        elif inst.opcode == "add.f":
+            self._write(inst.dst, _f32bits(_f32(self._read(inst.srcs[0])) + _f32(self._read(inst.srcs[1]))))
+        elif inst.opcode == "stg.u32":
+            self._store_u32(self._addr(inst.srcs[0], _s32(self._read(inst.srcs[1]))), self._read(inst.srcs[2]))
+        else:
+            # TODO: test for other instructions 
+            raise NotImplementedError(f"IR3 instruction {inst.opcode} at pc {inst.pc}")
+
+        # TODO: branches not implemented yet
+        self.pc += 1
+
+    def run(self) :
+        while not self.done: self.step()
+
+    def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|bytearray|memoryview=(), 
+                global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
+                workgroup_id_const: int|None=None, translate_addr: Callable[[int], int]|None=None,
+                init: Callable[[IR3Machine, tuple[int,int,int], tuple[int,int,int], tuple[int,int,int]], None]|None=None):
+        program = decode_program(code)
+        if any(g <= 0 for g in global_size) or any (l <= 0 for l in local_size): raise ValueError("IR3 launch sizes must be positive")
+        if any(g % l for g, l in zip(global_size, local_size)): raise ValueError("global_size must ne div by local_size")
+
+        # TODO simple serial execution with no cross-invocation state.
+        # adjust after initial version 
+        for z in range(global_size[2]):
+            for y in range(global_size[1]):
+                for x in range(global_size[0]):
+                    gid , lid = (x,y,z), (x%local_size[0], y%local_size[1], z%local_size[2])
+                    wgid = (x//local_size[0], y//local_size[1], z//local_size[2])
+                    machine = IR3Machine(program, constants, translate_addr)
+
+                    # TODO: IR3 compiler chooses physical regis for special inputs
+                    # the QCOMProgram will pass those regis here
+                    if local_id_reg is not None: 
+                        for i, v in enumerate(lid): machine.regs[local_id_reg+i]  = v
+
+                    if workgroup_id_const is not None:
+                        need = workgroup_id_const + 3
+                        if len(machine.constants) < need: machine.constants += [0] * (need-len(machine.constants))
+                        machine.constants[workgroup_id_const:need] = wgid
+                    if init is not None: init(machine, gid, lid, wgid)
+                    machine.run()
+
+        
         
             
 
