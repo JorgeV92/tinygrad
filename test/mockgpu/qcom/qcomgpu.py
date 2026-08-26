@@ -7,7 +7,7 @@ from typing import Callable, Sequence
 from tinygrad.helpers import to_mv
 from tinygrad.runtime.autogen import mesa
 from test.mockgpu.gpu import VirtGPU
-from test.mockgpu.qcom.emu import run_ir3
+from test.mockgpu.qcom.emu import ImageDescriptor, SamplerDescriptor, run_ir3
 
 MASK32 = 0xffffffff
 ABSENT_REGID = 0xfc
@@ -50,6 +50,8 @@ class LoadedState:
     state_block: int
     units: int
     address: int
+    dst_offset: int = 0
+    packet_opcode: int = mesa.CP_LOAD_STATE6_FRAG
 
 @dataclass(frozen=True)
 class DispatchRecord:
@@ -62,6 +64,12 @@ class DispatchRecord:
     total_size: tuple[int, int, int]
     shared_size: int
     private_size: int
+    private_base: int
+    private_total: int
+    private_stack_offset: int
+    samplers: tuple[SamplerDescriptor, ...]
+    textures: tuple[ImageDescriptor, ...]
+    uavs: tuple[ImageDescriptor, ...]
     local_id_reg: int|None
     workgroup_id_const: int|None
 
@@ -108,6 +116,8 @@ class QCOMGPU(VirtGPU):
         raise RuntimeError(f"unmapped QCOM address range {addr:#x}+{size:#x}")
 
     def _read_u32(self, addr: int) -> int: return int(to_mv(self.translate_addr(addr, 4), 4).cast("I")[0])
+    def _read_words(self, addr: int, count: int) -> tuple[int, ...]:
+        return tuple(to_mv(self.translate_addr(addr, count*4), count*4).cast("I"))
     def _write_u32(self, addr: int, value: int): to_mv(self.translate_addr(addr, 4), 4).cast("I")[0] = value & MASK32
     def _write_u64(self, addr: int, value: int): to_mv(self.translate_addr(addr, 8), 8).cast("Q")[0] = value & ((1 << 64) -1)
 
@@ -156,6 +166,7 @@ class QCOMGPU(VirtGPU):
 
             if packet_type == 4:
                 count, reg = header & 0x7f, (header >> 8) & 0x3ffff
+                if count == 0: raise RuntimeError(f"empty QCOM type-4 packet at dword {packet_pc}")
                 if ((header >> 7) & 1) != _parity(count) or ((header >> 27) & 1) != _parity(reg):
                     raise RuntimeError(f"bad QCOM type-4 parity at dword {packet_pc}")
                 payload = self._take_payload(stream, count, packet_pc)
@@ -188,15 +199,20 @@ class QCOMGPU(VirtGPU):
     def _execute_type7(self, opcode: int, payload: tuple[int, ...]) -> bool:
         if opcode == mesa.CP_SET_MARKER:
             self._require_count(opcode, payload, 1)
+            mode = _field(payload[0],mesa.A6XX_CP_SET_MARKER_0_MODE__MASK,mesa.A6XX_CP_SET_MARKER_0_MODE__SHIFT)
+            if mode != mesa.RM6_COMPUTE: raise NotImplementedError(f"QCOM marker mode {mode}")
             return True
         if opcode in (mesa.CP_WAIT_FOR_IDLE, mesa.CP_WAIT_MEM_WRITES):
             self._require_count(opcode, payload, 0)
             return True
-        if opcode == mesa.CP_LOAD_STATE6_FRAG:
-            self._execute_load_state6(payload)
+        if opcode in (mesa.CP_LOAD_STATE6_FRAG, mesa.CP_LOAD_STATE6_GEOM, mesa.CP_LOAD_STATE6):
+            self._execute_load_state6(opcode,payload)
             return True
         if opcode == mesa.CP_EXEC_CS:
             self._execute_compute(payload)
+            return True
+        if opcode == mesa.CP_EXEC_CS_INDIRECT:
+            self._execute_compute_indirect(payload)
             return True
         if opcode == mesa.CP_EVENT_WRITE:
             self._execute_event_write(payload)
@@ -218,16 +234,17 @@ class QCOMGPU(VirtGPU):
         if len (payload) != expected:
             raise RuntimeError(f"QCOM opcode {opcode:#x} expected {expected} payload dwords, got {len(payload)}")
 
-    def _execute_load_state6(self, payload: tuple[int, ...]):
-        self._require_count(mesa.CP_LOAD_STATE6_FRAG, payload, 3)
+    def _execute_load_state6(self, opcode: int, payload: tuple[int, ...]):
+        self._require_count(opcode, payload, 3)
         config, addr_lo, addr_hi = payload
+        dst_offset = _field(config, mesa.CP_LOAD_STATE6_0_DST_OFF__MASK, mesa.CP_LOAD_STATE6_0_DST_OFF__SHIFT)
         state_type = _field(config, mesa.CP_LOAD_STATE6_0_STATE_TYPE__MASK, mesa.CP_LOAD_STATE6_0_STATE_TYPE__SHIFT)
         state_source = _field(config, mesa.CP_LOAD_STATE6_0_STATE_SRC__MASK, mesa.CP_LOAD_STATE6_0_STATE_SRC__SHIFT)
         state_block = _field(config, mesa.CP_LOAD_STATE6_0_STATE_BLOCK__MASK, mesa.CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT)
         units = _field(config, mesa.CP_LOAD_STATE6_0_NUM_UNIT__MASK, mesa.CP_LOAD_STATE6_0_NUM_UNIT__SHIFT)
         if state_source != mesa.SS6_INDIRECT:
             raise NotImplementedError(f"QCOM LOAD_STATE6 source {state_source}; only SS6_INDIRECT is implemented")
-        loaded = LoadedState(state_type, state_source, state_block, units, _u64(addr_lo, addr_hi))
+        loaded = LoadedState(state_type, state_source, state_block, units, _u64(addr_lo, addr_hi),dst_offset,opcode)
         self.loaded_states[(state_block, state_type)] = loaded
 
     def _execute_event_write(self, payload: tuple[int, ...]):
@@ -303,12 +320,92 @@ class QCOMGPU(VirtGPU):
     def _shader_state(self) -> LoadedState:
         key = (mesa.SB6_CS_SHADER, mesa.ST_SHADER)
         if key not in self.loaded_states: raise RuntimeError("CP_EXEC_CS without a CS shader LOAD_STATE6 binding")
-        return self.loaded_states[key]
+        state = self.loaded_states[key]
+        if state.packet_opcode != mesa.CP_LOAD_STATE6_FRAG or state.dst_offset != 0:
+            raise RuntimeError("invalid A630 compute shader LOAD_STATE6 binding")
+        return state
 
     def _constant_state(self) -> LoadedState:
         key = (mesa.SB6_CS_SHADER, mesa.ST_CONSTANTS)
         if key not in self.loaded_states: raise RuntimeError("CP_EXEC_CS without a CS constants LOAD_STATE6 binding")
-        return self.loaded_states[key]
+        state = self.loaded_states[key]
+        if state.packet_opcode != mesa.CP_LOAD_STATE6_FRAG or state.dst_offset != 0:
+            raise RuntimeError("invalid A630 compute constant LOAD_STATE6 binding")
+        return state
+
+    def _descriptor_table(self, block: int, state_type: int, base_reg: int, count: int, stride: int,
+                          preload_count: int|None=None) -> tuple[tuple[int, ...], ...]:
+        if count == 0: return ()
+        key = (block,state_type)
+        if key not in self.loaded_states: raise RuntimeError(f"QCOM descriptor state {block}:{state_type} is not loaded")
+        state = self.loaded_states[key]
+        if state.packet_opcode != mesa.CP_LOAD_STATE6_FRAG:
+            raise RuntimeError(f"compute descriptor state used packet {state.packet_opcode:#x}")
+        if state.dst_offset != 0: raise NotImplementedError(f"QCOM descriptor destination offset {state.dst_offset}")
+        expected_units = count if preload_count is None else preload_count
+        if state.units != expected_units:
+            raise RuntimeError(f"QCOM descriptor preload has {state.units} units, expected {expected_units}")
+        base = _u64(self.read_reg(base_reg),self.read_reg(base_reg+1))
+        if base != state.address: raise RuntimeError(f"QCOM descriptor base {base:#x} disagrees with LOAD_STATE6 {state.address:#x}")
+        words = self._read_words(base,count*stride)
+        return tuple(tuple(words[i*stride:(i+1)*stride]) for i in range(count))
+
+    def _compute_descriptors(self) -> tuple[tuple[SamplerDescriptor,...],tuple[ImageDescriptor,...],tuple[ImageDescriptor,...]]:
+        config = self.read_reg(mesa.REG_A6XX_SP_CS_CONFIG)
+        if not config & mesa.A6XX_SP_CS_CONFIG_ENABLED: raise RuntimeError("CP_EXEC_CS with disabled A6XX_SP_CS_CONFIG")
+        if config & (mesa.A6XX_SP_CS_CONFIG_BINDLESS_TEX|mesa.A6XX_SP_CS_CONFIG_BINDLESS_SAMP|mesa.A6XX_SP_CS_CONFIG_BINDLESS_UAV):
+            raise NotImplementedError("A630 bindless compute descriptors")
+        nsamp = _field(config,mesa.A6XX_SP_CS_CONFIG_NSAMP__MASK,mesa.A6XX_SP_CS_CONFIG_NSAMP__SHIFT)
+        ntex = _field(config,mesa.A6XX_SP_CS_CONFIG_NTEX__MASK,mesa.A6XX_SP_CS_CONFIG_NTEX__SHIFT)
+        nuav = _field(config,mesa.A6XX_SP_CS_CONFIG_NUAV__MASK,mesa.A6XX_SP_CS_CONFIG_NUAV__SHIFT)
+        sampler_words = self._descriptor_table(mesa.SB6_CS_TEX,mesa.ST_SHADER,mesa.REG_A6XX_SP_CS_SAMPLER_BASE,nsamp,4)
+        texture_words = self._descriptor_table(mesa.SB6_CS_TEX,mesa.ST_CONSTANTS,mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE,ntex,16,min(16,ntex))
+        uav_words = self._descriptor_table(mesa.SB6_CS_SHADER,mesa.ST6_UAV,mesa.REG_A6XX_SP_CS_UAV_BASE,nuav,16)
+        samplers = tuple(SamplerDescriptor((x[0],x[1],x[2],x[3])) for x in sampler_words)
+        textures, uavs = tuple(ImageDescriptor(x) for x in texture_words), tuple(ImageDescriptor(x) for x in uav_words)
+        for sampler in samplers:
+            if sampler.wrap != (mesa.A6XX_TEX_CLAMP_TO_BORDER,)*3 or not sampler.unnormalized:
+                raise NotImplementedError("A630 sampler mode outside tinygrad's unnormalized clamp-to-border state")
+        for descriptor in (*textures,*uavs):
+            if descriptor.texture_type != mesa.A6XX_TEX_2D: raise NotImplementedError(f"A630 texture type {descriptor.texture_type}")
+            if descriptor.width <= 0 or descriptor.height <= 0: raise RuntimeError("A630 image descriptor has an empty extent")
+            row_size = descriptor.width*descriptor.channel_size*4
+            if descriptor.pitch < row_size: raise RuntimeError(f"A630 image pitch {descriptor.pitch} is smaller than row size {row_size}")
+            self.translate_addr(descriptor.address,(descriptor.height-1)*descriptor.pitch+row_size)
+        return samplers,textures,uavs
+
+    def _compute_memory_config(self) -> tuple[int,int,int,int,int]:
+        shared_config = self.read_reg(mesa.REG_A6XX_SP_CS_CNTL_1)
+        shared_allowed = mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK|mesa.A6XX_SP_CS_CNTL_1_CONSTANTRAMMODE__MASK
+        if shared_config & ~shared_allowed: raise RuntimeError(f"unknown A630 shared-memory configuration {shared_config:#x}")
+        shared_size = (_field(shared_config,mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK,
+                              mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__SHIFT)+1)*1024
+        private_config = self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM)
+        private_size = _field(private_config,mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK,
+                              mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT)*512
+        private_base = _u64(self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_BASE),self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_BASE+1))
+        private_size_config = self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_SIZE)
+        private_total = _field(private_size_config,mesa.A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE__MASK,
+                               mesa.A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE__SHIFT)*512
+        private_stack_offset = _field(self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET),
+                                      mesa.A6XX_SP_CS_PVT_MEM_STACK_OFFSET_OFFSET__MASK,
+                                      mesa.A6XX_SP_CS_PVT_MEM_STACK_OFFSET_OFFSET__SHIFT)
+        if private_size:
+            if private_base == 0 or private_total < private_size: raise RuntimeError("invalid A630 private-memory allocation")
+            self.translate_addr(private_base,private_total)
+        return shared_size,private_size,private_base,private_total,private_stack_offset
+
+    def _execute_compute_indirect(self, payload: tuple[int, ...]):
+        self._require_count(mesa.CP_EXEC_CS_INDIRECT,payload,4)
+        control, addr_lo, addr_hi, packed_local = payload
+        if control != 0: raise NotImplementedError(f"CP_EXEC_CS_INDIRECT control word {control:#x}")
+        local_size = (
+            _field(packed_local,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__MASK,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__SHIFT)+1,
+            _field(packed_local,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__MASK,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__SHIFT)+1,
+            _field(packed_local,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__MASK,mesa.A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__SHIFT)+1,
+        )
+        if local_size != self._local_size(): raise RuntimeError(f"indirect local size {local_size} disagrees with NDRANGE {self._local_size()}")
+        self._execute_compute((0,*self._read_words(_u64(addr_lo,addr_hi),3)))
 
     def _execute_compute(self, payload: tuple[int, ...]):
         self._require_count(mesa.CP_EXEC_CS, payload, 4)
@@ -350,27 +447,20 @@ class QCOMGPU(VirtGPU):
                      mesa.A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID__SHIFT)
         workgroup_id_const = None if wgid == ABSENT_REGID else wgid
         local_id_reg = None if lid == ABSENT_REGID else lid
-        shared_config = self.read_reg(mesa.REG_A6XX_SP_CS_CNTL_1)
-        shared_size = (_field(shared_config, mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK,
-                              mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__SHIFT)+1)*1024
-        private_config = self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM)
-        private_size = _field(private_config, mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK,
-                              mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT)*512
+        shared_size,private_size,private_base,private_total,private_stack_offset = self._compute_memory_config()
+        samplers,textures,uavs = self._compute_descriptors()
 
         constants_size = constants.units * 16
         code = to_mv(self.translate_addr(shader.address, shader_size), shader_size)
         constant_data = to_mv(self.translate_addr(constants.address, constants_size), constants_size)
         record = DispatchRecord(shader.address, shader_size, constants.address, constants_size, group_count, local_size,
-                                total_size, shared_size, private_size, local_id_reg, workgroup_id_const)
+                                total_size, shared_size, private_size, private_base, private_total, private_stack_offset,
+                                samplers, textures, uavs, local_id_reg, workgroup_id_const)
         self.dispatches.append(record)
 
         if self.debug >= 1:
             print(f"QCOM dispatch groups={group_count} local={local_size} shader={shader.address:#x}+{shader_size:#x}")
         self.ir3_runner(code, constants=constant_data, global_size=total_size, local_size=local_size,
                         local_id_reg=local_id_reg, workgroup_id_const=workgroup_id_const,
-                        translate_addr=self.translate_addr, shared_size=shared_size, private_size=private_size)
-
-__all__ = [
-  "ABSENT_REGID", "CommandStream", "DispatchRecord", "LoadedState", "MappedRange", "QCOMGPU",
-  "pkt4_header", "pkt7_header",
-]
+                        translate_addr=self.translate_addr, shared_size=shared_size, private_size=private_size,
+                        samplers=samplers, textures=textures, uavs=uavs)

@@ -3,6 +3,7 @@ import math, struct
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 from tinygrad.helpers import to_mv
+from tinygrad.runtime.autogen import mesa
 
 MASK16, MASK32, MASK64 = 0xffff, 0xffffffff, 0xffffffffffffffff
 TYPE_F16, TYPE_F32, TYPE_U16, TYPE_U32, TYPE_S16, TYPE_S32, TYPE_U8, TYPE_U8_32 = range(8)
@@ -79,6 +80,52 @@ class IR3Instruction:
     branch_offset: int = 0
     invert: tuple[bool, ...] = ()
     rounding: int = 0
+    write_mask: int = 0
+    sampler: int = -1
+    texture: int = -1
+    dimension: int = 0
+
+@dataclass(frozen=True)
+class SamplerDescriptor:
+    words: tuple[int, int, int, int]
+
+    @property
+    def wrap(self) -> tuple[int,int,int]: return (_bits(self.words[0],5,7),_bits(self.words[0],8,10),_bits(self.words[0],11,13))
+
+    @property
+    def unnormalized(self) -> bool: return bool(_bits(self.words[1],5,5))
+
+@dataclass(frozen=True)
+class ImageDescriptor:
+    words: tuple[int, ...]
+
+    @property
+    def fmt(self) -> int: return _bits(self.words[0],22,29)
+
+    @property
+    def swizzle(self) -> tuple[int,int,int,int]:
+        return (_bits(self.words[0],4,6),_bits(self.words[0],7,9),_bits(self.words[0],10,12),_bits(self.words[0],13,15))
+
+    @property
+    def width(self) -> int: return _bits(self.words[1],0,14)
+
+    @property
+    def height(self) -> int: return _bits(self.words[1],15,29)
+
+    @property
+    def pitch(self) -> int: return _bits(self.words[2],7,28)
+
+    @property
+    def texture_type(self) -> int: return _bits(self.words[2],29,31)
+
+    @property
+    def address(self) -> int: return ((self.words[5]&0x1ffff)<<32)|(self.words[4]&MASK32)
+
+    @property
+    def channel_size(self) -> int:
+        if self.fmt == mesa.FMT6_32_32_32_32_FLOAT: return 4
+        if self.fmt == mesa.FMT6_16_16_16_16_FLOAT: return 2
+        raise NotImplementedError(f"A630 image format {self.fmt}")
 
 def _reg(num: int, half: bool=False, modifier: int=0, repeat: bool=False) -> IR3Operand:
     if not half and 0xf4 <= num <= 0xf7: return IR3Operand("addr", num=num-0xf4, modifier=modifier, repeat=repeat)
@@ -208,8 +255,28 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
         src = _decode_multisrc(_bits(raw,0,15),not full,bool(_bits(raw,43,43)) if repeat else False)
         return IR3Instruction(pc,raw,opcs[opc],_reg(dst_num,full == dst_conv and dst_num <= 0xf7),(src,),repeat=repeat,
                               saturate=bool(_bits(raw,42,42)))
+    if cat == 5:
+        opc = _bits(raw,54,58)
+        if opc != 0: raise NotImplementedError(f"IR3 cat5 opcode {opc:#x} at pc {pc}")
+        if _bits(raw,51,51): raise NotImplementedError(f"IR3 indirect or bindless isam at pc {pc}")
+        typ, write_mask = _bits(raw,44,46), _bits(raw,40,43)
+        if write_mask == 0: raise RuntimeError(f"IR3 isam with empty write mask at pc {pc}")
+        return IR3Instruction(pc,raw,"isam",_reg(_bits(raw,32,39),typ in HALF_TYPES),(_reg(_bits(raw,1,8),not bool(raw&1)),),
+                              src_type=typ,dst_type=typ,width=write_mask.bit_count(),write_mask=write_mask,
+                              sampler=_bits(raw,21,24),texture=_bits(raw,25,31),dimension=1 if not _bits(raw,18,18) else 2)
     if cat == 6:
         opc, typ = _bits(raw,54,58), _bits(raw,49,51)
+        if _bits(raw,20,22) == 6 and _bits(raw,52,53) == 2 and _bits(raw,14,19) in (6,29):
+            if _bits(raw,8,8): raise NotImplementedError(f"IR3 bindless IBO access at pc {pc}")
+            mode, uav_num = _bits(raw,6,7), _bits(raw,41,48)
+            if mode not in (0,1,2): raise NotImplementedError(f"IR3 IBO descriptor mode {mode} at pc {pc}")
+            uav = _imm(uav_num) if mode == 0 else _reg(uav_num)
+            coordinate, value = _reg(_bits(raw,24,31)), _reg(_bits(raw,32,39),typ in HALF_TYPES)
+            offset = (((_bits(raw,4,5)<<5)|opc) if _bits(raw,23,23) else 0)
+            name = "ldib" if _bits(raw,14,19) == 6 else "stib"
+            ibo_dst, ibo_srcs = (value,(uav,coordinate,_imm(offset))) if name == "ldib" else (None,(uav,coordinate,value,_imm(offset)))
+            return IR3Instruction(pc,raw,name,ibo_dst,ibo_srcs,src_type=typ,dst_type=typ,width=_bits(raw,12,13)+1,
+                                  dimension=_bits(raw,9,10)+1)
         if opc == 0:
             size = _bits(raw,24,26)
             if size < 1: raise NotImplementedError(f"IR3 cat6 load size {size}")
@@ -294,7 +361,8 @@ def _type_size(typ: int) -> int: return 2 if typ in (TYPE_F16,TYPE_U16,TYPE_S16)
 class IR3Machine:
     def __init__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(),
                  translate_addr: Callable[[int],int]|None=None, shared_memory: bytearray|memoryview|None=None,
-                 private_size: int=0):
+                 private_size: int=0, samplers: Sequence[SamplerDescriptor]=(), textures: Sequence[ImageDescriptor]=(),
+                 uavs: Sequence[ImageDescriptor]=()):
         if private_size < 0: raise ValueError("IR3 private memory size must be nonnegative")
         self.program, self.regs, self.hregs = tuple(program), [0]*256, [0]*256
         self.addr, self.pred = [0]*4, [0]*4
@@ -306,6 +374,7 @@ class IR3Machine:
         self.translate_addr = translate_addr or (lambda x:x)
         self.shared = memoryview(shared_memory if shared_memory is not None else bytearray()).cast("B")
         self.private = memoryview(bytearray(private_size)).cast("B")
+        self.samplers, self.textures, self.uavs = tuple(samplers), tuple(textures), tuple(uavs)
         self.pc, self.done, self.waiting, self.predication, self.predication_mask = 0, False, False, 0, False
         self.call_stack: list[int] = []
 
@@ -425,6 +494,36 @@ class IR3Machine:
         else: self._store_local(self.shared,addr,result_bits,size,"shared")
         self._write_scalar(inst.dst,old,size)
 
+    def _image_location(self, descriptor: ImageDescriptor, coordinate: IR3Operand, dimension: int, offset: int=0) -> tuple[int,bool]:
+        x = _s32(self._read(coordinate))+offset
+        if dimension == 1:
+            y, x = divmod(x,descriptor.width) if descriptor.width else (0,0)
+        else:
+            y = _s32(self._read(replace(coordinate,num=coordinate.num+1)))
+        valid = 0 <= x < descriptor.width and 0 <= y < descriptor.height
+        return descriptor.address+y*descriptor.pitch+x*descriptor.channel_size*4, valid
+
+    def _image_load(self, descriptor: ImageDescriptor, coordinate: IR3Operand, dimension: int, typ: int, offset: int=0) -> list[int]:
+        address, valid = self._image_location(descriptor,coordinate,dimension,offset)
+        if not valid: return [0,0,0,0]
+        size = descriptor.channel_size
+        raw = [self._load_global(address+i*size,size) for i in range(4)]
+        channels = [_f16(x) if size == 2 else _f32(x) for x in raw]
+        swizzled = [channels[x] if x < 4 else 0.0 if x == 4 else 1.0 for x in descriptor.swizzle]
+        return [_typed_bits(x,typ) for x in swizzled]
+
+    def _image_store(self, descriptor: ImageDescriptor, coordinate: IR3Operand, dimension: int, values: IR3Operand, width: int, offset: int=0):
+        address, valid = self._image_location(descriptor,coordinate,dimension,offset)
+        if not valid: return
+        size = descriptor.channel_size
+        for i in range(width):
+            value_op = self._offset(values,i)
+            assert value_op is not None
+            value = self._read(value_op)
+            if values.half != (size == 2):
+                value = _f16bits(_f32(value)) if size == 2 else _f32bits(_f16(value))
+            self._store_global(address+i*size,value,size)
+
     @staticmethod
     def _cond(condition: int, a, b) -> bool:
         conds = (a<b,a<=b,a>b,a>=b,a==b,a!=b)
@@ -523,6 +622,21 @@ class IR3Machine:
             take = (values[0] if inst.opcode in ("br","bany","ball") else any(values) if inst.opcode == "brao" else
                     all(values) if inst.opcode == "braa" else True)
             if take: next_pc = inst.pc+inst.branch_offset
+        elif inst.opcode == "isam":
+            if not 0 <= inst.texture < len(self.textures): raise RuntimeError(f"IR3 texture slot {inst.texture} is not bound")
+            if not 0 <= inst.sampler < len(self.samplers): raise RuntimeError(f"IR3 sampler slot {inst.sampler} is not bound")
+            image_values = self._image_load(self.textures[inst.texture],inst.srcs[0],inst.dimension,inst.dst_type)
+            output = [image_values[i] for i in range(4) if inst.write_mask&(1<<i)]
+            for i,value in enumerate(output): self._write(self._offset(inst.dst,i),value)
+        elif inst.opcode == "ldib":
+            slot = self._read(inst.srcs[0])
+            if not 0 <= slot < len(self.uavs): raise RuntimeError(f"IR3 UAV slot {slot} is not bound")
+            image_values = self._image_load(self.uavs[slot],inst.srcs[1],inst.dimension,inst.dst_type,_s32(self._read(inst.srcs[2])))
+            for i,value in enumerate(image_values[:inst.width]): self._write(self._offset(inst.dst,i),value)
+        elif inst.opcode == "stib":
+            slot = self._read(inst.srcs[0])
+            if not 0 <= slot < len(self.uavs): raise RuntimeError(f"IR3 UAV slot {slot} is not bound")
+            self._image_store(self.uavs[slot],inst.srcs[1],inst.dimension,inst.srcs[2],inst.width,_s32(self._read(inst.srcs[3])))
         elif inst.opcode.startswith("ldg.a."):
             size = _type_size(inst.dst_type)
             shift = self._read(inst.srcs[3])
@@ -574,7 +688,8 @@ def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|byt
             global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
             workgroup_id_const: int|None=None, translate_addr: Callable[[int],int]|None=None,
             init: Callable[[IR3Machine,tuple[int,int,int],tuple[int,int,int],tuple[int,int,int]],None]|None=None,
-            shared_size: int=0, private_size: int=0):
+            shared_size: int=0, private_size: int=0, samplers: Sequence[SamplerDescriptor]=(),
+            textures: Sequence[ImageDescriptor]=(), uavs: Sequence[ImageDescriptor]=()):
     program = decode_program(code)
     if any(g <= 0 for g in global_size) or any(l <= 0 for l in local_size): raise ValueError("IR3 launch sizes must be positive")
     if any(g%l for g,l in zip(global_size,local_size)): raise ValueError("global_size must be divisible by local_size")
@@ -589,7 +704,7 @@ def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|byt
                         for lx in range(local_size[0]):
                             lid = (lx,ly,lz)
                             gid = (wx*local_size[0]+lx,wy*local_size[1]+ly,wz*local_size[2]+lz)
-                            machine = IR3Machine(program,constants,translate_addr,shared,private_size)
+                            machine = IR3Machine(program,constants,translate_addr,shared,private_size,samplers,textures,uavs)
                             if local_id_reg is not None:
                                 for i,val in enumerate(lid): machine._write(_reg(local_id_reg+i),val)
                             if workgroup_id_const is not None:

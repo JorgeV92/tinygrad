@@ -238,4 +238,3 @@ class QCOMDriver(VirtDriver):
             raise NotImplementedError(f"unknown KGSL ioctl number {nr:#x} (request {request:#x})")
         return 0
 
-__all__ = ["A630_CHIP_ID", "KGSLAllocation", "KGSLContext", "KGSLFileDesc", "KGSLSubmission", "KGSLUserMapping", "QCOMDriver"]
