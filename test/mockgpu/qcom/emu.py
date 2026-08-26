@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 from tinygrad.helpers import to_mv
 
-MASK16, MASK32 = 0xffff, 0xffffffff
+MASK16, MASK32, MASK64 = 0xffff, 0xffffffff, 0xffffffffffffffff
 TYPE_F16, TYPE_F32, TYPE_U16, TYPE_U32, TYPE_S16, TYPE_S32, TYPE_U8, TYPE_U8_32 = range(8)
 TYPE_NAMES = ("f16", "f32", "u16", "u32", "s16", "s32", "u8", "u8_32")
 HALF_TYPES = {TYPE_F16, TYPE_U16, TYPE_S16, TYPE_U8}
@@ -211,19 +211,50 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
     if cat == 6:
         opc, typ = _bits(raw,54,58), _bits(raw,49,51)
         if opc == 0:
-            if _bits(raw,22,22): raise NotImplementedError("ldg.a")
             size = _bits(raw,24,26)
             if size < 1: raise NotImplementedError(f"IR3 cat6 load size {size}")
             src, dst = _reg(_bits(raw,14,21)), _reg(_bits(raw,32,39),typ in HALF_TYPES)
+            if _bits(raw,22,22):
+                return IR3Instruction(pc,raw,f"ldg.a.{TYPE_NAMES[typ]}",dst,
+                                      (src,_reg(_bits(raw,1,8)),_imm(_bits(raw,9,10)),_imm(_bits(raw,12,13))),
+                                      src_type=typ,dst_type=typ,width=size)
             return IR3Instruction(pc,raw,f"ldg.{TYPE_NAMES[typ]}",dst,(src,_imm(_sext(_bits(raw,1,13),13))),
                                   src_type=typ,dst_type=typ,width=size)
+        if opc in (1,2,10):
+            size = _bits(raw,24,31)
+            if size < 1: raise NotImplementedError(f"IR3 cat6 load size {size}")
+            name = {1:"ldl",2:"ldp",10:"ldlw"}[opc]
+            return IR3Instruction(pc,raw,f"{name}.{TYPE_NAMES[typ]}",_reg(_bits(raw,32,39),typ in HALF_TYPES),
+                                  (_reg(_bits(raw,14,21)),_imm(_sext(_bits(raw,1,13),13))),src_type=typ,dst_type=typ,width=size)
         if opc == 3:
-            if _bits(raw,52,52): raise NotImplementedError("stg.a")
             size = _bits(raw,24,26)
             if size < 1: raise NotImplementedError(f"IR3 cat6 store size {size}")
+            if _bits(raw,52,52):
+                return IR3Instruction(pc,raw,f"stg.a.{TYPE_NAMES[typ]}",None,
+                                      (_reg(_bits(raw,41,48)),_reg(_bits(raw,32,39)),_imm(_bits(raw,9,10)),
+                                       _imm(_bits(raw,12,13)),_reg(_bits(raw,1,8),typ in HALF_TYPES)),
+                                      src_type=typ,dst_type=typ,width=size)
             off = _sext((_bits(raw,9,13)<<8)|_bits(raw,32,39),13)
             addr, val = _reg(_bits(raw,41,48)), _reg(_bits(raw,1,8),typ in HALF_TYPES)
             return IR3Instruction(pc,raw,f"stg.{TYPE_NAMES[typ]}",None,(addr,_imm(off),val),src_type=typ,dst_type=typ,width=size)
+        if opc in (4,5,11):
+            size = _bits(raw,24,31)
+            if size < 1: raise NotImplementedError(f"IR3 cat6 store size {size}")
+            name = {4:"stl",5:"stp",11:"stlw"}[opc]
+            off = _sext((_bits(raw,9,13)<<8)|_bits(raw,32,39),13)
+            return IR3Instruction(pc,raw,f"{name}.{TYPE_NAMES[typ]}",None,
+                                  (_reg(_bits(raw,41,48)),_imm(off),_reg(_bits(raw,1,8),typ in HALF_TYPES)),
+                                  src_type=typ,dst_type=typ,width=size)
+        if 16 <= opc <= 26:
+            atomic_names = ("add","sub","xchg","inc","dec","cmpxchg","min","max","and","or","xor")
+            if _bits(raw,9,10) != 0 or _bits(raw,12,13) != 0:
+                raise NotImplementedError(f"IR3 cat6 vector atomic at pc {pc}")
+            src1_num, src2_num = _bits(raw,14,21), _bits(raw,24,31)
+            src1 = _imm(src1_num) if _bits(raw,22,22) else _reg(src1_num)
+            src2 = _imm(src2_num) if _bits(raw,23,23) else _reg(src2_num)
+            space = "global" if _bits(raw,52,52) else "local"
+            return IR3Instruction(pc,raw,f"atomic.{space}.{atomic_names[opc-16]}",_reg(_bits(raw,32,39)),(src1,src2),
+                                  src_type=typ,dst_type=typ)
         raise NotImplementedError(f"IR3 cat6 opcode {opc:#x} at pc {pc}")
     if cat == 7:
         opc = _bits(raw,55,58)
@@ -262,7 +293,9 @@ def _type_size(typ: int) -> int: return 2 if typ in (TYPE_F16,TYPE_U16,TYPE_S16)
 
 class IR3Machine:
     def __init__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(),
-                 translate_addr: Callable[[int],int]|None=None):
+                 translate_addr: Callable[[int],int]|None=None, shared_memory: bytearray|memoryview|None=None,
+                 private_size: int=0):
+        if private_size < 0: raise ValueError("IR3 private memory size must be nonnegative")
         self.program, self.regs, self.hregs = tuple(program), [0]*256, [0]*256
         self.addr, self.pred = [0]*4, [0]*4
         if isinstance(constants,(bytes,bytearray,memoryview)):
@@ -271,7 +304,9 @@ class IR3Machine:
             self.constants = list(mv.cast("I"))
         else: self.constants = [_u32(x) for x in constants]
         self.translate_addr = translate_addr or (lambda x:x)
-        self.pc, self.done, self.predication, self.predication_mask = 0, False, 0, False
+        self.shared = memoryview(shared_memory if shared_memory is not None else bytearray()).cast("B")
+        self.private = memoryview(bytearray(private_size)).cast("B")
+        self.pc, self.done, self.waiting, self.predication, self.predication_mask = 0, False, False, 0, False
         self.call_stack: list[int] = []
 
     def _offset(self, op: IR3Operand|None, amount: int) -> IR3Operand|None:
@@ -325,11 +360,70 @@ class IR3Machine:
 
     def _addr64(self, op: IR3Operand, off: int=0) -> int:
         if op.kind != "gpr" or op.half or op.num == 255: raise RuntimeError(f"invalid 64-bit address reg {op}")
-        return ((self.regs[op.num+1]<<32)|self.regs[op.num])+off
+        return ((((self.regs[op.num+1]&MASK32)<<32)|(self.regs[op.num]&MASK32))+off)&MASK64
 
-    def _load(self, addr: int, size: int) -> int: return int.from_bytes(to_mv(self.translate_addr(addr),size).cast("B"),"little")
-    def _store(self, addr: int, val: int, size: int):
-        to_mv(self.translate_addr(addr),size).cast("B")[:] = (val&((1<<(size*8))-1)).to_bytes(size,"little")
+    def _load_global(self, addr: int, size: int) -> int:
+        return int.from_bytes(to_mv(self.translate_addr(addr&MASK64),size).cast("B"),"little")
+
+    def _store_global(self, addr: int, val: int, size: int):
+        to_mv(self.translate_addr(addr&MASK64),size).cast("B")[:] = (val&((1<<(size*8))-1)).to_bytes(size,"little")
+
+    @staticmethod
+    def _load_local(memory: memoryview, addr: int, size: int, space: str) -> int:
+        if addr < 0 or addr+size > memory.nbytes: raise RuntimeError(f"IR3 {space} load out of bounds: {addr:#x}+{size:#x}")
+        return int.from_bytes(memory[addr:addr+size],"little")
+
+    @staticmethod
+    def _store_local(memory: memoryview, addr: int, val: int, size: int, space: str):
+        if addr < 0 or addr+size > memory.nbytes: raise RuntimeError(f"IR3 {space} store out of bounds: {addr:#x}+{size:#x}")
+        memory[addr:addr+size] = (val&((1<<(size*8))-1)).to_bytes(size,"little")
+
+    def _read_scalar(self, op: IR3Operand, size: int) -> int:
+        if size <= 4: return self._read(op)&((1<<(size*8))-1)
+        if size != 8 or op.kind != "gpr" or op.half or op.num == 255: raise RuntimeError(f"invalid {size}-byte source {op}")
+        return ((self.regs[op.num+1]&MASK32)<<32)|(self.regs[op.num]&MASK32)
+
+    def _write_scalar(self, op: IR3Operand|None, value: int, size: int):
+        if size <= 4: self._write(op,value)
+        elif size == 8 and op is not None and op.kind == "gpr" and not op.half and op.num != 255:
+            self.regs[op.num], self.regs[op.num+1] = value&MASK32, (value>>32)&MASK32
+        else: raise RuntimeError(f"invalid {size}-byte destination {op}")
+
+    def _atomic(self, inst: IR3Instruction):
+        typ, op = inst.src_type, inst.opcode.rsplit(".",1)[1]
+        global_space = ".global." in inst.opcode
+        size = 8 if global_space and typ == 6 else _type_size(typ)
+        if global_space:
+            addr = self._addr64(inst.srcs[0])
+            old = self._load_global(addr,size)
+        else:
+            addr = self._read(inst.srcs[0])
+            old = self._load_local(self.shared,addr,size,"shared")
+        value = self._read_scalar(inst.srcs[1],size)
+        if typ in (TYPE_F16,TYPE_F32):
+            old_value, value_value = _typed_value(old,typ), _typed_value(value,typ)
+        elif typ in (TYPE_S16,TYPE_S32):
+            old_value, value_value = _typed_value(old,typ), _typed_value(value,typ)
+        else: old_value, value_value = old, value
+        if op == "add": result = old_value+value_value
+        elif op == "sub": result = old_value-value_value
+        elif op == "xchg": result = value
+        elif op == "inc": result = old+1
+        elif op == "dec": result = old-1
+        elif op == "min": result = min(old_value,value_value)
+        elif op == "max": result = max(old_value,value_value)
+        elif op == "and": result = old&value
+        elif op == "or": result = old|value
+        elif op == "xor": result = old^value
+        elif op == "cmpxchg":
+            if inst.srcs[1].kind != "gpr": raise RuntimeError("IR3 cmpxchg requires a register collect")
+            replacement = self._read_scalar(replace(inst.srcs[1],num=inst.srcs[1].num+max(1,size//4)),size)
+            result = replacement if old == value else old
+        else: raise NotImplementedError(inst.opcode)
+        result_bits = _typed_bits(result,typ) if typ in (TYPE_F16,TYPE_F32) and op in ("add","sub","min","max") else int(result)
+        if global_space: self._store_global(addr,result_bits,size)
+        else: self._store_local(self.shared,addr,result_bits,size,"shared")
+        self._write_scalar(inst.dst,old,size)
 
     @staticmethod
     def _cond(condition: int, a, b) -> bool:
@@ -402,7 +496,7 @@ class IR3Machine:
         else: raise NotImplementedError(f"IR3 instruction {op} at pc {inst.pc}")
 
     def step(self):
-        if self.done: return
+        if self.done or self.waiting: return
         if not 0 <= self.pc < len(self.program): raise RuntimeError(f"IR3 pc out of range: {self.pc}")
         inst, next_pc = self.program[self.pc], self.pc+1
         if self.predication and inst.opcode not in ("predt","predf","prede"):
@@ -429,39 +523,82 @@ class IR3Machine:
             take = (values[0] if inst.opcode in ("br","bany","ball") else any(values) if inst.opcode == "brao" else
                     all(values) if inst.opcode == "braa" else True)
             if take: next_pc = inst.pc+inst.branch_offset
+        elif inst.opcode.startswith("ldg.a."):
+            size = _type_size(inst.dst_type)
+            shift = self._read(inst.srcs[3])
+            type_shift = 0 if inst.dst_type >= TYPE_U8 else 1 if inst.dst_type in HALF_TYPES else 2
+            addr = self._addr64(inst.srcs[0],((self._read(inst.srcs[1])<<shift)+self._read(inst.srcs[2]))<<type_shift)
+            for i in range(inst.width): self._write(self._offset(inst.dst,i),self._load_global(addr+i*size,size))
         elif inst.opcode.startswith("ldg."):
             size, addr = _type_size(inst.dst_type), self._addr64(inst.srcs[0],_s32(self._read(inst.srcs[1])))
-            for i in range(inst.width): self._write(self._offset(inst.dst,i),self._load(addr+i*size,size))
+            for i in range(inst.width): self._write(self._offset(inst.dst,i),self._load_global(addr+i*size,size))
+        elif inst.opcode.startswith(("ldl.","ldlw.","ldp.")):
+            size, addr = _type_size(inst.dst_type), _s32(self._read(inst.srcs[0]))+_s32(self._read(inst.srcs[1]))
+            memory, space = (self.private,"private") if inst.opcode.startswith("ldp.") else (self.shared,"shared")
+            for i in range(inst.width): self._write(self._offset(inst.dst,i),self._load_local(memory,addr+i*size,size,space))
+        elif inst.opcode.startswith("stg.a."):
+            size = _type_size(inst.src_type)
+            shift = self._read(inst.srcs[3])
+            type_shift = 0 if inst.src_type >= TYPE_U8 else 1 if inst.src_type in HALF_TYPES else 2
+            addr = self._addr64(inst.srcs[0],((self._read(inst.srcs[1])<<shift)+self._read(inst.srcs[2]))<<type_shift)
+            for i in range(inst.width):
+                value_op = self._offset(inst.srcs[4],i)
+                assert value_op is not None
+                self._store_global(addr+i*size,self._read(value_op),size)
         elif inst.opcode.startswith("stg."):
             size, addr = _type_size(inst.src_type), self._addr64(inst.srcs[0],_s32(self._read(inst.srcs[1])))
             for i in range(inst.width):
                 value_op = self._offset(inst.srcs[2],i)
                 assert value_op is not None
-                self._store(addr+i*size,self._read(value_op),size)
-        elif inst.opcode in {"bar","fence","sleep","icinv","dccln","dcinv","dcflu"}: pass
+                self._store_global(addr+i*size,self._read(value_op),size)
+        elif inst.opcode.startswith(("stl.","stlw.","stp.")):
+            size, addr = _type_size(inst.src_type), _s32(self._read(inst.srcs[0]))+_s32(self._read(inst.srcs[1]))
+            memory, space = (self.private,"private") if inst.opcode.startswith("stp.") else (self.shared,"shared")
+            for i in range(inst.width):
+                value_op = self._offset(inst.srcs[2],i)
+                assert value_op is not None
+                self._store_local(memory,addr+i*size,self._read(value_op),size,space)
+        elif inst.opcode.startswith("atomic."): self._atomic(inst)
+        elif inst.opcode == "bar": self.waiting = True
+        elif inst.opcode in {"fence","sleep","icinv","dccln","dcinv","dcflu"}: pass
         else:
             for iteration in range(inst.repeat+1): self._execute_alu(inst,iteration)
         self.pc = next_pc
 
     def run(self):
-        while not self.done: self.step()
+        while not self.done:
+            self.step()
+            if self.waiting: self.waiting = False
 
 def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|bytearray|memoryview=(),
             global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
             workgroup_id_const: int|None=None, translate_addr: Callable[[int],int]|None=None,
-            init: Callable[[IR3Machine,tuple[int,int,int],tuple[int,int,int],tuple[int,int,int]],None]|None=None):
+            init: Callable[[IR3Machine,tuple[int,int,int],tuple[int,int,int],tuple[int,int,int]],None]|None=None,
+            shared_size: int=0, private_size: int=0):
     program = decode_program(code)
     if any(g <= 0 for g in global_size) or any(l <= 0 for l in local_size): raise ValueError("IR3 launch sizes must be positive")
     if any(g%l for g,l in zip(global_size,local_size)): raise ValueError("global_size must be divisible by local_size")
-    for z in range(global_size[2]):
-        for y in range(global_size[1]):
-            for x in range(global_size[0]):
-                gid, lid = (x,y,z), (x%local_size[0],y%local_size[1],z%local_size[2])
-                wgid = (x//local_size[0],y//local_size[1],z//local_size[2])
-                machine = IR3Machine(program,constants,translate_addr)
-                if local_id_reg is not None:
-                    for i,val in enumerate(lid): machine._write(_reg(local_id_reg+i),val)
-                if workgroup_id_const is not None:
-                    for i,val in enumerate(wgid): machine._write(_reg(workgroup_id_const+i),val)
-                if init is not None: init(machine,gid,lid,wgid)
-                machine.run()
+    if shared_size < 0 or private_size < 0: raise ValueError("IR3 memory sizes must be nonnegative")
+    group_count = tuple(g//l for g,l in zip(global_size,local_size))
+    for wz in range(group_count[2]):
+        for wy in range(group_count[1]):
+            for wx in range(group_count[0]):
+                wgid, shared, machines = (wx,wy,wz), bytearray(shared_size), []
+                for lz in range(local_size[2]):
+                    for ly in range(local_size[1]):
+                        for lx in range(local_size[0]):
+                            lid = (lx,ly,lz)
+                            gid = (wx*local_size[0]+lx,wy*local_size[1]+ly,wz*local_size[2]+lz)
+                            machine = IR3Machine(program,constants,translate_addr,shared,private_size)
+                            if local_id_reg is not None:
+                                for i,val in enumerate(lid): machine._write(_reg(local_id_reg+i),val)
+                            if workgroup_id_const is not None:
+                                for i,val in enumerate(wgid): machine._write(_reg(workgroup_id_const+i),val)
+                            if init is not None: init(machine,gid,lid,wgid)
+                            machines.append(machine)
+                while any(not machine.done for machine in machines):
+                    runnable = [machine for machine in machines if not machine.done and not machine.waiting]
+                    if runnable:
+                        for machine in runnable: machine.step()
+                    else:
+                        for machine in machines: machine.waiting = False

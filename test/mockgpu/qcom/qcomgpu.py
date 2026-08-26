@@ -60,6 +60,8 @@ class DispatchRecord:
     group_count: tuple[int, int, int]
     local_size: tuple[int, int, int]
     total_size: tuple[int, int, int]
+    shared_size: int
+    private_size: int
     local_id_reg: int|None
     workgroup_id_const: int|None
 
@@ -348,19 +350,25 @@ class QCOMGPU(VirtGPU):
                      mesa.A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID__SHIFT)
         workgroup_id_const = None if wgid == ABSENT_REGID else wgid
         local_id_reg = None if lid == ABSENT_REGID else lid
+        shared_config = self.read_reg(mesa.REG_A6XX_SP_CS_CNTL_1)
+        shared_size = (_field(shared_config, mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__MASK,
+                              mesa.A6XX_SP_CS_CNTL_1_SHARED_SIZE__SHIFT)+1)*1024
+        private_config = self.read_reg(mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM)
+        private_size = _field(private_config, mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__MASK,
+                              mesa.A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM__SHIFT)*512
 
         constants_size = constants.units * 16
         code = to_mv(self.translate_addr(shader.address, shader_size), shader_size)
         constant_data = to_mv(self.translate_addr(constants.address, constants_size), constants_size)
         record = DispatchRecord(shader.address, shader_size, constants.address, constants_size, group_count, local_size,
-                                total_size, local_id_reg, workgroup_id_const)
+                                total_size, shared_size, private_size, local_id_reg, workgroup_id_const)
         self.dispatches.append(record)
 
         if self.debug >= 1:
             print(f"QCOM dispatch groups={group_count} local={local_size} shader={shader.address:#x}+{shader_size:#x}")
         self.ir3_runner(code, constants=constant_data, global_size=total_size, local_size=local_size,
                         local_id_reg=local_id_reg, workgroup_id_const=workgroup_id_const,
-                        translate_addr=self.translate_addr)
+                        translate_addr=self.translate_addr, shared_size=shared_size, private_size=private_size)
 
 __all__ = [
   "ABSENT_REGID", "CommandStream", "DispatchRecord", "LoadedState", "MappedRange", "QCOMGPU",
