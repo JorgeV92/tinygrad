@@ -17,9 +17,13 @@ def _sext(x: int, bits: int) -> int: return x - (1 << bits) if x & (1 << (bits-1
 def _u32(x: int) -> int: return x & MASK32
 def _s32(x: int) -> int: return _sext(x & MASK32, 32)
 def _f32(x: int) -> float: return struct.unpack("<f", struct.pack("<I", x & MASK32))[0]
-def _f32bits(x: float) -> int: return struct.unpack("<I", struct.pack("<f", x))[0]
+def _f32bits(x: float) -> int:
+    try: return struct.unpack("<I", struct.pack("<f", x))[0]
+    except OverflowError: return 0xff800000 if math.copysign(1.0, x) < 0 else 0x7f800000
 def _f16(x: int) -> float: return struct.unpack("<e", struct.pack("<H", x & MASK16))[0]
-def _f16bits(x: float) -> int: return struct.unpack("<H", struct.pack("<e", x))[0]
+def _f16bits(x: float) -> int:
+    try: return struct.unpack("<H", struct.pack("<e", x))[0]
+    except OverflowError: return 0xfc00 if math.copysign(1.0, x) < 0 else 0x7c00
 
 def _sfu(op: str, x: float) -> float:
     if op == "rcp": return math.copysign(math.inf,x) if x == 0 else 1/x
@@ -414,8 +418,12 @@ class IR3Machine:
         offset_op = self._offset(op,iteration if op.repeat else 0)
         assert offset_op is not None
         val = self._read(offset_op)
+        float_op = ".f" in inst.opcode or inst.opcode in {"rcp","rsq","log2","exp2","sin","cos","sqrt","hrsq","hlog2","hexp2"}
+        # Half-precision float ALU converts 32-bit constant-file values to f16;
+        # half GPRs and integer constant operands already contain packed bits.
+        if offset_op.kind == "const" and op.half and float_op: val = _f16bits(_f32(self.constants[offset_op.num]))
         if not op.modifier: return val
-        if ".f" in inst.opcode or inst.opcode in {"rcp","rsq","log2","exp2","sin","cos","sqrt","hrsq","hlog2","hexp2"}:
+        if float_op:
             fval = _f16(val) if op.half else _f32(val)
             if op.modifier&2: fval = abs(fval)
             if op.modifier&1: fval = -fval
@@ -543,6 +551,7 @@ class IR3Machine:
         op = inst.opcode
         if op.startswith(("mov.","cov.")):
             val = _typed_value(src[0],inst.src_type)
+            if inst.src_type == TYPE_U8 and inst.dst_type in (TYPE_S16, TYPE_S32): val = _sext(src[0]&0xff, 8)
             if isinstance(val,float) and inst.dst_type not in (TYPE_F16,TYPE_F32):
                 val = (round(val) if inst.rounding == 1 else math.ceil(val) if inst.rounding == 2 else
                        math.floor(val) if inst.rounding == 3 else int(val))
@@ -568,10 +577,16 @@ class IR3Machine:
         elif op in ("mul.u24","mul.s24","mull.u"):
             if op == "mul.s24": a,b = _sext(src[0]&0xffffff,24),_sext(src[1]&0xffffff,24)
             elif op == "mul.u24": a,b = src[0]&0xffffff,src[1]&0xffffff
-            else: a,b = src[0],src[1]
+            else: a,b = src[0]&MASK16,src[1]&MASK16
             self._write(dst,a*b)
         elif op == "bfrev.b": self._write(dst,int(f"{src[0]&MASK32:032b}"[::-1],2))
-        elif op in ("clz.s","clz.b"): self._write(dst,32-(src[0]&MASK32).bit_length())
+        elif op == "clz.b":
+            value = src[0]&MASK32
+            self._write(dst,-1 if value == 0 else 32-value.bit_length())
+        elif op == "clz.s":
+            value = src[0]&MASK32
+            if value&(1<<31): value ^= MASK32
+            self._write(dst,32-value.bit_length())
         elif op == "cbits.b": self._write(dst,(src[0]&MASK32).bit_count())
         elif op == "shl.b": self._write(dst,src[0]<<(src[1]&31))
         elif op == "shr.b": self._write(dst,src[0]>>(src[1]&31))
@@ -579,11 +594,17 @@ class IR3Machine:
         elif op == "getbit.b": self._write(dst,(src[0]>>(src[1]&31))&1)
         elif op == "mgen.b": self._write(dst,((1<<min(src[0],32))-1)<<(src[1]&31))
         elif op.startswith("mad."):
-            val = floats[0]*floats[1]+floats[2] if ".f" in op else src[0]*src[1]+src[2]
+            if ".f" in op: val = floats[0]*floats[1]+floats[2]
+            elif op == "mad.u16": val = (src[0]&MASK16)*(src[1]&MASK16)+src[2]
+            elif op == "mad.s16": val = _sext(src[0]&MASK16,16)*_sext(src[1]&MASK16,16)+src[2]
+            elif op == "mad.u24": val = (src[0]&0xffffff)*(src[1]&0xffffff)+src[2]
+            elif op == "mad.s24": val = _sext(src[0]&0xffffff,24)*_sext(src[1]&0xffffff,24)+src[2]
+            else: raise NotImplementedError(op)
             if op.endswith(".mul2"): val *= 2
             if op.endswith(".div2"): val *= 0.5
             self._write(dst,self._float_bits(val,dst.half,inst.saturate) if ".f" in op and dst is not None else val)
-        elif op.startswith("madsh."): self._write(dst,((src[0]*src[1])>>16)+src[2])
+        elif op == "madsh.u16": self._write(dst,(((src[0]&MASK16)*(src[1]&MASK16))>>16)+src[2])
+        elif op == "madsh.m16": self._write(dst,((src[0]&MASK16)*_sext((src[1]>>16)&MASK16,16)<<16)+src[2])
         elif op.startswith("sel."): self._write(dst,src[0] if src[1] else src[2])
         elif op.startswith("sad."): self._write(dst,abs(signed[0]-signed[1])+src[2])
         elif op in ("shrm","shlm","shrg","shlg","andg"):
