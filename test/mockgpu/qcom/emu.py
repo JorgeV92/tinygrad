@@ -1,5 +1,5 @@
 from __future__ import annotations
-import math, struct
+import functools, math, struct
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 from tinygrad.helpers import to_mv
@@ -67,6 +67,15 @@ class IR3Operand:
         pfx = ("hc" if self.half else "c") if self.kind == "const" else "hr" if self.half else "r"
         return f"{pfx}{self.num//4}.{('x','y','z','w')[self.num&3]}"
 
+@functools.cache
+def _offset_operand(op: IR3Operand, amount: int) -> IR3Operand:
+    if op.kind in ("gpr","const"): return replace(op,num=op.num+amount)
+    if op.kind in ("addr","pred"):
+        num = op.num+amount
+        if num >= 4: raise RuntimeError(f"special register repeat out of bounds: {op}")
+        return replace(op,num=num)
+    return op
+
 @dataclass(frozen=True)
 class IR3Instruction:
     pc: int
@@ -88,6 +97,7 @@ class IR3Instruction:
     sampler: int = -1
     texture: int = -1
     dimension: int = 0
+    dst2: IR3Operand | None = None
 
 @dataclass(frozen=True)
 class SamplerDescriptor:
@@ -193,6 +203,11 @@ def decode_instruction(raw: int, pc: int=0) -> IR3Instruction:
     if cat == 1:
         src_type, dst_type, mode = _bits(raw,50,52), _bits(raw,46,48), _bits(raw,53,54)
         half, src_repeat = src_type in HALF_TYPES, bool(_bits(raw,43,43))
+        if _bits(raw,55,58) == 8 and _bits(raw,40,42) == 0:
+            dst = _reg(_bits(raw,32,39),dst_type in HALF_TYPES)
+            swz_srcs = (_reg(_bits(raw,0,7),half),_reg(_bits(raw,8,15),half))
+            return IR3Instruction(pc,raw,f"swz.{TYPE_NAMES[src_type]}{TYPE_NAMES[dst_type]}",dst,swz_srcs,src_type=src_type,dst_type=dst_type,
+                                  dst2=_reg(_bits(raw,16,23),dst_type in HALF_TYPES))
         if mode == 0:
             if _bits(raw,11,11):
                 kind = "relative_const" if _bits(raw,10,10) else "relative_gpr"
@@ -364,7 +379,7 @@ def _type_size(typ: int) -> int: return 2 if typ in (TYPE_F16,TYPE_U16,TYPE_S16)
 
 class IR3Machine:
     def __init__(self, program: Sequence[IR3Instruction], constants: Sequence[int]|bytes|bytearray|memoryview=(),
-                 translate_addr: Callable[[int],int]|None=None, shared_memory: bytearray|memoryview|None=None,
+                 translate_addr: Callable[[int,int],int]|None=None, shared_memory: bytearray|memoryview|None=None,
                  private_size: int=0, samplers: Sequence[SamplerDescriptor]=(), textures: Sequence[ImageDescriptor]=(),
                  uavs: Sequence[ImageDescriptor]=()):
         if private_size < 0: raise ValueError("IR3 private memory size must be nonnegative")
@@ -375,7 +390,7 @@ class IR3Machine:
             if mv.nbytes&3: raise ValueError("IR3 constant data must be 4-byte aligned")
             self.constants = list(mv.cast("I"))
         else: self.constants = [_u32(x) for x in constants]
-        self.translate_addr = translate_addr or (lambda x:x)
+        self.translate_addr = translate_addr or (lambda x,size:x)
         self.shared = memoryview(shared_memory if shared_memory is not None else bytearray()).cast("B")
         self.private = memoryview(bytearray(private_size)).cast("B")
         self.samplers, self.textures, self.uavs = tuple(samplers), tuple(textures), tuple(uavs)
@@ -384,12 +399,7 @@ class IR3Machine:
 
     def _offset(self, op: IR3Operand|None, amount: int) -> IR3Operand|None:
         if op is None or amount == 0: return op
-        if op.kind in ("gpr","const"): return replace(op,num=op.num+amount)
-        if op.kind in ("addr","pred"):
-            num = op.num+amount
-            if num >= 4: raise RuntimeError(f"special register repeat out of bounds: {op}")
-            return replace(op,num=num)
-        return op
+        return _offset_operand(op,amount)
 
     def _read(self, op: IR3Operand) -> int:
         if op.kind == "imm": return _u32(op.imm)
@@ -415,13 +425,14 @@ class IR3Machine:
 
     def _source(self, inst: IR3Instruction, idx: int, iteration: int=0) -> int:
         op = inst.srcs[idx]
-        offset_op = self._offset(op,iteration if op.repeat else 0)
-        assert offset_op is not None
+        offset_op = _offset_operand(op,iteration) if op.repeat and iteration else op
         val = self._read(offset_op)
+        half_const = offset_op.kind == "const" and op.half
+        if not op.modifier and not half_const: return val
         float_op = ".f" in inst.opcode or inst.opcode in {"rcp","rsq","log2","exp2","sin","cos","sqrt","hrsq","hlog2","hexp2"}
         # Half-precision float ALU converts 32-bit constant-file values to f16;
         # half GPRs and integer constant operands already contain packed bits.
-        if offset_op.kind == "const" and op.half and float_op: val = _f16bits(_f32(self.constants[offset_op.num]))
+        if half_const and float_op: val = _f16bits(_f32(self.constants[offset_op.num]))
         if not op.modifier: return val
         if float_op:
             fval = _f16(val) if op.half else _f32(val)
@@ -440,10 +451,10 @@ class IR3Machine:
         return ((((self.regs[op.num+1]&MASK32)<<32)|(self.regs[op.num]&MASK32))+off)&MASK64
 
     def _load_global(self, addr: int, size: int) -> int:
-        return int.from_bytes(to_mv(self.translate_addr(addr&MASK64),size).cast("B"),"little")
+        return int.from_bytes(to_mv(self.translate_addr(addr&MASK64,size),size).cast("B"),"little")
 
     def _store_global(self, addr: int, val: int, size: int):
-        to_mv(self.translate_addr(addr&MASK64),size).cast("B")[:] = (val&((1<<(size*8))-1)).to_bytes(size,"little")
+        to_mv(self.translate_addr(addr&MASK64,size),size).cast("B")[:] = (val&((1<<(size*8))-1)).to_bytes(size,"little")
 
     @staticmethod
     def _load_local(memory: memoryview, addr: int, size: int, space: str) -> int:
@@ -546,32 +557,53 @@ class IR3Machine:
         src = [self._source(inst,i,iteration) for i in range(len(inst.srcs))]
         half = inst.srcs[0].half
         dst = self._offset(inst.dst,iteration)
-        floats = [_f16(x) if half else _f32(x) for x in src]
-        signed = [_sext(x&(MASK16 if half else MASK32),16 if half else 32) for x in src]
         op = inst.opcode
-        if op.startswith(("mov.","cov.")):
-            val = _typed_value(src[0],inst.src_type)
-            if inst.src_type == TYPE_U8 and inst.dst_type in (TYPE_S16, TYPE_S32): val = _sext(src[0]&0xff, 8)
-            if isinstance(val,float) and inst.dst_type not in (TYPE_F16,TYPE_F32):
-                val = (round(val) if inst.rounding == 1 else math.ceil(val) if inst.rounding == 2 else
-                       math.floor(val) if inst.rounding == 3 else int(val))
-            if inst.saturate and inst.dst_type in (TYPE_F16,TYPE_F32): val = min(1.0,max(0.0,val))
-            self._write(dst,_typed_bits(val,inst.dst_type))
+        if op == "mad.f32":
+            mad_value = _f32(src[0])*_f32(src[1])+_f32(src[2])
+            self._write(dst,self._float_bits(mad_value,dst.half if dst else half,inst.saturate))
+        elif op.startswith("mad."):
+            if ".f" in op:
+                mad_floats = [_f16(x) if half else _f32(x) for x in src]
+                mad_value = mad_floats[0]*mad_floats[1]+mad_floats[2]
+                if op.endswith(".mul2"): mad_value *= 2
+                if op.endswith(".div2"): mad_value *= 0.5
+                self._write(dst,self._float_bits(mad_value,dst.half if dst else half,inst.saturate))
+            else:
+                if op == "mad.u16": mad_int = (src[0]&MASK16)*(src[1]&MASK16)+src[2]
+                elif op == "mad.s16": mad_int = _sext(src[0]&MASK16,16)*_sext(src[1]&MASK16,16)+src[2]
+                elif op == "mad.u24": mad_int = (src[0]&0xffffff)*(src[1]&0xffffff)+src[2]
+                elif op == "mad.s24": mad_int = _sext(src[0]&0xffffff,24)*_sext(src[1]&0xffffff,24)+src[2]
+                else: raise NotImplementedError(op)
+                self._write(dst,mad_int)
+        elif op == "add.u": self._write(dst,src[0]+src[1])
+        elif op in ("add.s","sub.u","sub.s"): self._write(dst,src[0]+src[1] if op == "add.s" else src[0]-src[1])
+        elif op.startswith(("mov.","cov.","swz.")):
+            for value,dest in zip(src,(dst,self._offset(inst.dst2,iteration)) if op.startswith("swz.") else (dst,)):
+                val = _typed_value(value,inst.src_type)
+                if inst.src_type == TYPE_U8 and inst.dst_type in (TYPE_S16, TYPE_S32): val = _sext(value&0xff, 8)
+                if isinstance(val,float) and inst.dst_type not in (TYPE_F16,TYPE_F32):
+                    val = (round(val) if inst.rounding == 1 else math.ceil(val) if inst.rounding == 2 else
+                           math.floor(val) if inst.rounding == 3 else int(val))
+                if inst.saturate and inst.dst_type in (TYPE_F16,TYPE_F32): val = min(1.0,max(0.0,val))
+                self._write(dest,_typed_bits(val,inst.dst_type))
         elif op in ("add.f","mul.f","min.f","max.f","mul.f.mul2","add.f.mul2","mul.f.div2","add.f.div2"):
+            floats = [_f16(x) if half else _f32(x) for x in src]
             val = {"add.f":floats[0]+floats[1],"mul.f":floats[0]*floats[1],"min.f":min(floats),"max.f":max(floats),
                    "mul.f.mul2":floats[0]*floats[1]*2,"add.f.mul2":(floats[0]+floats[1])*2,
                    "mul.f.div2":floats[0]*floats[1]*0.5,"add.f.div2":(floats[0]+floats[1])*0.5}[op]
             self._write(dst,self._float_bits(val,dst.half if dst else half,inst.saturate))
         elif op in ("sign.f","absneg.f","floor.f","ceil.f","rndne.f","rndaz.f","trunc.f"):
-            self._write(dst,self._float_bits(_unary_float(op,floats[0]),dst.half if dst else half,inst.saturate))
+            self._write(dst,self._float_bits(_unary_float(op,_f16(src[0]) if half else _f32(src[0])),dst.half if dst else half,inst.saturate))
         elif op.startswith(("cmps.","cmpv.")):
-            vals = floats if op.endswith(".f") else signed if op.endswith(".s") else src
-            self._write(dst,int(self._cond(inst.condition,*vals[:2])))
-        elif op in ("add.u","add.s","sub.u","sub.s"): self._write(dst,src[0]+src[1] if op.startswith("add") else src[0]-src[1])
+            cmp_vals: Sequence[float|int]
+            if op.endswith(".f"): cmp_vals = [_f16(x) if half else _f32(x) for x in src]
+            elif op.endswith(".s"): cmp_vals = [_sext(x&(MASK16 if half else MASK32),16 if half else 32) for x in src]
+            else: cmp_vals = src
+            self._write(dst,int(self._cond(inst.condition,*cmp_vals[:2])))
         elif op in ("min.u","max.u","min.s","max.s"):
-            vals = signed if op.endswith(".s") else src
-            self._write(dst,min(vals) if op.startswith("min") else max(vals))
-        elif op == "absneg.s": self._write(dst,signed[0])
+            minmax_vals = [_sext(x&(MASK16 if half else MASK32),16 if half else 32) for x in src] if op.endswith(".s") else src
+            self._write(dst,min(minmax_vals) if op.startswith("min") else max(minmax_vals))
+        elif op == "absneg.s": self._write(dst,_sext(src[0]&(MASK16 if half else MASK32),16 if half else 32))
         elif op in ("and.b","or.b","xor.b"): self._write(dst,{"and.b":src[0]&src[1],"or.b":src[0]|src[1],"xor.b":src[0]^src[1]}[op])
         elif op == "not.b": self._write(dst,~src[0])
         elif op in ("mul.u24","mul.s24","mull.u"):
@@ -590,29 +622,21 @@ class IR3Machine:
         elif op == "cbits.b": self._write(dst,(src[0]&MASK32).bit_count())
         elif op == "shl.b": self._write(dst,src[0]<<(src[1]&31))
         elif op == "shr.b": self._write(dst,src[0]>>(src[1]&31))
-        elif op == "ashr.b": self._write(dst,signed[0]>>(src[1]&31))
+        elif op == "ashr.b": self._write(dst,_sext(src[0]&(MASK16 if half else MASK32),16 if half else 32)>>(src[1]&31))
         elif op == "getbit.b": self._write(dst,(src[0]>>(src[1]&31))&1)
         elif op == "mgen.b": self._write(dst,((1<<min(src[0],32))-1)<<(src[1]&31))
-        elif op.startswith("mad."):
-            if ".f" in op: val = floats[0]*floats[1]+floats[2]
-            elif op == "mad.u16": val = (src[0]&MASK16)*(src[1]&MASK16)+src[2]
-            elif op == "mad.s16": val = _sext(src[0]&MASK16,16)*_sext(src[1]&MASK16,16)+src[2]
-            elif op == "mad.u24": val = (src[0]&0xffffff)*(src[1]&0xffffff)+src[2]
-            elif op == "mad.s24": val = _sext(src[0]&0xffffff,24)*_sext(src[1]&0xffffff,24)+src[2]
-            else: raise NotImplementedError(op)
-            if op.endswith(".mul2"): val *= 2
-            if op.endswith(".div2"): val *= 0.5
-            self._write(dst,self._float_bits(val,dst.half,inst.saturate) if ".f" in op and dst is not None else val)
         elif op == "madsh.u16": self._write(dst,(((src[0]&MASK16)*(src[1]&MASK16))>>16)+src[2])
         elif op == "madsh.m16": self._write(dst,((src[0]&MASK16)*_sext((src[1]>>16)&MASK16,16)<<16)+src[2])
         elif op.startswith("sel."): self._write(dst,src[0] if src[1] else src[2])
-        elif op.startswith("sad."): self._write(dst,abs(signed[0]-signed[1])+src[2])
+        elif op.startswith("sad."):
+            signed = [_sext(x&(MASK16 if half else MASK32),16 if half else 32) for x in src[:2]]
+            self._write(dst,abs(signed[0]-signed[1])+src[2])
         elif op in ("shrm","shlm","shrg","shlg","andg"):
             grouped = {"shrm":(src[1]>>(src[0]&31))&src[2],"shlm":(src[1]<<(src[0]&31))&src[2],"shrg":(src[1]>>(src[0]&31))|src[2],
                        "shlg":(src[1]<<(src[0]&31))|src[2],"andg":(src[1]&src[0])|src[2]}
             self._write(dst,grouped[op])
         elif op in {"rcp","rsq","log2","exp2","sin","cos","sqrt","hrsq","hlog2","hexp2"}:
-            self._write(dst,self._float_bits(_sfu(op,floats[0]),dst.half if dst else half,inst.saturate))
+            self._write(dst,self._float_bits(_sfu(op,_f16(src[0]) if half else _f32(src[0])),dst.half if dst else half,inst.saturate))
         else: raise NotImplementedError(f"IR3 instruction {op} at pc {inst.pc}")
 
     def step(self):
@@ -625,7 +649,9 @@ class IR3Machine:
             if not enabled:
                 self.pc = next_pc
                 return
-        if inst.opcode == "nop": pass
+        if 1 <= inst.raw >> 61 <= 4:
+            for iteration in range(inst.repeat+1): self._execute_alu(inst,iteration)
+        elif inst.opcode == "nop": pass
         elif inst.opcode == "end": self.done = True
         elif inst.opcode == "kill":
             if bool(self._read(inst.srcs[0]))^inst.invert[0]: self.done = True
@@ -696,8 +722,7 @@ class IR3Machine:
         elif inst.opcode.startswith("atomic."): self._atomic(inst)
         elif inst.opcode == "bar": self.waiting = True
         elif inst.opcode in {"fence","sleep","icinv","dccln","dcinv","dcflu"}: pass
-        else:
-            for iteration in range(inst.repeat+1): self._execute_alu(inst,iteration)
+        else: raise NotImplementedError(f"IR3 instruction {inst.opcode} at pc {inst.pc}")
         self.pc = next_pc
 
     def run(self):
@@ -707,7 +732,7 @@ class IR3Machine:
 
 def run_ir3(code: bytes|bytearray|memoryview, constants: Sequence[int]|bytes|bytearray|memoryview=(),
             global_size: tuple[int,int,int]=(1,1,1), local_size: tuple[int,int,int]=(1,1,1), local_id_reg: int|None=None,
-            workgroup_id_const: int|None=None, translate_addr: Callable[[int],int]|None=None,
+            workgroup_id_const: int|None=None, translate_addr: Callable[[int,int],int]|None=None,
             init: Callable[[IR3Machine,tuple[int,int,int],tuple[int,int,int],tuple[int,int,int]],None]|None=None,
             shared_size: int=0, private_size: int=0, samplers: Sequence[SamplerDescriptor]=(),
             textures: Sequence[ImageDescriptor]=(), uavs: Sequence[ImageDescriptor]=()):
