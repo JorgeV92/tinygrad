@@ -80,14 +80,17 @@ def load_rewrites(data:VizData) -> None:
   for i,k in enumerate(data.trace.keys):
     steps:list[dict] = []
     ki:KernelInfo|None = None
-    for j,s in enumerate(data.trace.rewrites[i]):
+    lin_idx:int|None = None
+    for j,s in enumerate(rewrites:=data.trace.rewrites[i]):
       steps.append(create_step(s.name, ("/graph-rewrites", i, j), loc=s.loc, match_count=len(s.matches), code_line=printable(s.loc),
                                trace=k.tb if j==0 else None, depth=s.depth))
       # get source and binary from Ops.PROGRAM
-      if s.name == "linearize/render":
-        steps.append(create_step("View UOp List", ("/uops", i, len(steps)), j, depth=s.depth))
-        steps.append(create_step("View Source", ("/code", i, len(steps)), j, depth=s.depth))
-        steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), (k.ret, j), depth=s.depth))
+      if s.name == "linearize/render": lin_idx = j
+      if lin_idx is not None and (j+1 == len(rewrites) or rewrites[j+1].depth <= rewrites[lin_idx].depth):
+        steps.append(create_step("View UOp List", ("/uops", i, len(steps)), lin_idx, depth=0))
+        steps.append(create_step("View Source", ("/code", i, len(steps)), lin_idx, depth=0))
+        steps.append(create_step("View Disassembly", ("/asm", i, len(steps)), (k.ret, lin_idx), depth=0))
+        lin_idx = None
       if s.name == "View Program": ki = _reconstruct(data, s.sink, depth=1).src[0].arg
     for key in k.keys: data.ref_map[canonicalize_ast(key) if isinstance(key, UOp) else key] = i
     data.ctxs.append({"name":k.display_name, "steps":steps, "ki":ki})
@@ -130,8 +133,8 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
       if u.op in GroupOp.Movement and u.marg: argst = (mask_to_str if u.op in {Ops.SHRINK, Ops.PAD} else shape_to_str)(u.marg)
     if u.op is Ops.BINARY: argst = f"<{len(u.arg)} bytes>"
     if u.op is Ops.CONST and dtypes.is_float(u.dtype): argst = f"{u.val:g}"
-    wrap_len = 200 if u.op is Ops.SOURCE else 80
-    label = f"{str(u.op).split('.')[1]}{(chr(10)+word_wrap(argst.replace(':', ''), wrap=wrap_len)) if u.arg is not None else ''}"
+    if u.op is not Ops.SOURCE: argst = word_wrap(argst.replace(':', ''))
+    label = f"{str(u.op).split('.')[1]}{(chr(10)+argst) if u.arg is not None else ''}"
     if u.dtype != dtypes.void: label += f"\n{u.dtype}"
     for idx,x in enumerate(u.src[:1] if u.op in {Ops.STAGE, Ops.INDEX} else (u.src if u.op is not Ops.END else [])):
       if x in excluded:
@@ -148,7 +151,7 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
       if u.op is Ops.CALL:
         label += f"\n{u.src[0].key.hex()[:8]}\n{u.src[0].op}"
       if u.op in {Ops.INDEX, Ops.STAGE}:
-        if len(u.src) > 1: label += f"\n{u.render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 30 else "\nINDEX TOO LARGE"
+        if len(u.src) > 1: label += f"\n{u.render()}" if sum(len(s.toposort()) for s in u.src[1:]) < 50 else "\nINDEX TOO LARGE"
         ranges: list[UOp] = []
         for us in u.src[1:]: ranges += [s for s in us.toposort() if s.op in {Ops.RANGE, Ops.SPECIAL}]
         if ranges: label += "\n"+' '.join([f"{s.render()}={s.vmax+1}" for s in ranges])
@@ -159,11 +162,7 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
       label += "\n<ISSUE GETTING LABEL>"
     ref = data.ref_map.get(canonicalize_ast(u.body)) if u.op is Ops.CALL else None
     if ref is not None: label += f"\ncodegen@{fmt_colored(data.ctxs[ref]['name'])}"
-    # NOTE: kernel already has metadata in arg
-    if TRACEMETA >= 2 and u.metadata is not None and u.op is not Ops.CALL: label += "\n"+str(u.metadata)
-    # limit SOURCE labels line count
-    if u.op is Ops.SOURCE and len(lines:=label.split("\n")) > 40:
-      label = "\n".join(lines[:30]) + "\n..."
+    if TRACEMETA >= 2 and u.metadata is not None: label += "\n"+str(u.metadata)
     addrspace_color:str|None = None
     with soft_err(): addrspace_color = addrspace_colors.get(u.addrspace, None) if u.addrspace is not None else None
     color = uops_colors.get(u.op, "#ffffff")
@@ -377,10 +376,11 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, 
   from tinygrad.renderer.amd.sqtt import (map_insts, InstructionInfo, PacketType, INST, InstOp, VALUINST, IMMEDIATE, IMMEDIATE_MASK, VMEMEXEC,
                                           ALUEXEC, INST_RDNA4, InstOpRDNA4, TS_DELTA_OR_MARK, TS_DELTA_OR_MARK_RDNA4, CDNA_INST, InstOpCDNA,
                                           CDNA_ISSUE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND, WAVERDY)
-  pc_map = {addr:str(inst) for addr,inst in amd_decode(lib, target).items()}
+  decoded = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
+  pc_map = {addr:str(inst) for addr,inst in decoded.items()}
   row_ends:dict[str, Decimal] = {}
   row_counts:dict[str, itertools.count] = {}
-  curr_barrier:dict[int, ProfileRangeEvent] = {}
+  curr_barrier:dict[tuple[int, int], ProfileRangeEvent] = {}
   exec_pending:dict[str, list[tuple[str, str]]] = {}
   dispatch_to_exec = {"WMMA":"VALU", "VALU":"VALU", "VALU1":"VALU", "VALUT":"VALU", "VALUB":"VALU", "VALUINST":"VALU", "VINTERP":"VALU",
                       "SGMEM":"VMEM", "FLAT":"VMEM", "LDS":"LDS", "SALU":"SALU", "SMEM":"SALU", "VMEM":"VMEM"}
@@ -389,6 +389,7 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, 
     if (simd:=getattr(p, "simd", None)) is not None: row += f" SIMD:{simd}"
     # extend packets to the architectural instruction issue interval
     start_time, end_time = p._time, p._time+(4 if target.startswith("gfx9") else 1)
+    if isinstance(p, CDNA_WAVEEND): start_time, end_time = start_time+4, end_time+4
     # exec links to dispatch, dispatch links to PC
     link:dict|None = {"pc":info.pc} if info else None
     if isinstance(p, (ALUEXEC, VMEMEXEC)):
@@ -427,8 +428,8 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, 
                               Decimal(p._time+(mfma_delay:=4)), Decimal(p._time+mfma_delay+duration))
     # barrier on this wave extends to fill the time it was waiting
     if wave is not None:
-      if (barrier:=curr_barrier.pop(wave, None)) is not None: barrier.en = Decimal(p._time)
-      if name in {"BARRIER", "BARRIER_SIGNAL"}: curr_barrier[wave] = e
+      if (barrier:=curr_barrier.pop((simd or 0, wave), None)) is not None: barrier.en = Decimal(p._time)
+      if name in {"BARRIER", "BARRIER_SIGNAL"}: curr_barrier[(simd or 0, wave)] = e
   NS_PER_TICK = 10  # 100MHz
   prev_pair:tuple[int, int]|None = None # (shader, realtime)
   yield ProfilePointEvent("", "JSON", "waveColors", list(wave_colors.items()), ts=Decimal(0))
@@ -444,13 +445,14 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, 
     if isinstance(p, (INST, INST_RDNA4, CDNA_INST)):
       name = p.op.name if isinstance(p.op, (InstOp, InstOpRDNA4, InstOpCDNA)) else f"0x{p.op:02x}"
       if name == "VALU_MAI" and unwrap(info).inst.op_name.startswith(("V_MFMA_F", "V_MFMA_I", "V_MFMA_SCALE_")): name += "_MFMA"
+      if isinstance(p, CDNA_INST) and unwrap(info).inst.op_name == "S_BARRIER": name = "BARRIER"
       yield from add(name, p, info=info)
     if isinstance(p, (VALUINST, IMMEDIATE, WAVEEND, WAVEEND_RDNA4, CDNA_WAVEEND)): yield from add(p.__class__.__name__, p, info=info)
     if isinstance(p, (IMMEDIATE_MASK, CDNA_ISSUE)): yield from add("IMMEDIATE", p, wave=unwrap(info).wave, info=info)
     if isinstance(p, WAVERDY):
       for wave in range(16):
         if p.mask & (1 << wave):
-          if wave in curr_barrier: yield from add("WAVERDY", p, wave=wave)
+          if (0, wave) in curr_barrier: yield from add("WAVERDY", p, wave=wave)
     if isinstance(p, (VMEMEXEC, ALUEXEC)):
       name = str(p.src).split('.')[1]
       if name == "VALU_SALU":
@@ -550,14 +552,16 @@ def get_elf_section(lib:bytes, name:str):
   from tinygrad.runtime.support.elf import elf_loader
   return next((sh for sh in elf_loader(lib)[1] if sh.name == name))
 
-def amd_decode(lib:bytes, target:str) -> dict[int, Inst]:
-  text = get_elf_section(lib, ".text")
-  off, buf = text.header.sh_addr, text.content
-  arch = "rdna3" if target.startswith("gfx11") else "rdna4" if target.startswith("gfx12") else "cdna"
+def get_arch(target:str) -> str: return "rdna3" if target.startswith("gfx11") else "rdna4" if target.startswith("gfx12") else "cdna"
+
+def amd_decode(buf:bytes, arch:str, off:int=0) -> dict[int, Inst]:
+  from tinygrad.runtime.autogen.amd.rdna3.ins import s_code_end
+  code_end = s_code_end().to_bytes()*5 if arch.startswith("rdna") else None
   addr_table:dict[int, Inst] = {}
   offset = 0
   while offset < len(buf):
     remaining = buf[offset:]
+    if code_end is not None and remaining.startswith(code_end): break
     fmt = detect_format(remaining, arch)
     decoded = fmt.from_bytes(remaining)
     addr_table[off+offset] = decoded
@@ -582,7 +586,7 @@ def is_acc_operand(inst, name:str) -> bool:
 COND_TAKEN, COND_NOT_TAKEN, UNCOND = range(3)
 def amdgpu_cfg(lib:bytes, target:str) -> dict:
   # decode
-  pc_table = amd_decode(lib, target)
+  pc_table = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
   # get leaders
   leaders:set[int] = {next(iter(pc_table))}
   for pc, inst in pc_table.items():
@@ -608,10 +612,12 @@ def amdgpu_cfg(lib:bytes, target:str) -> dict:
     pc_tokens[pc] = tokens = []
     for name, f in inst._fields:
       if isinstance(val:=getattr(inst, name), Reg):
+        if inst.operands and name not in inst.operands: continue
         reg_str = val.fmt().replace("v", "a", 1) if (is_acc:=is_acc_operand(inst, name)) else val.fmt()
         tokens.append({"st":reg_str, "keys":[f"{'a' if is_acc else 'r'}{val.offset+i}" for i in range(val.sz)], "kind":1})
       elif name in {"op","opx","opy"}: tokens.append({"st":(op_name:=val.name.lower()), "keys":[op_name], "kind":0})
-      elif name != "encoding" and val != f.default: tokens.append({"st":(s:=repr(val)), "keys":[s], "kind":1})
+      elif name != "encoding" and val != f.default:
+        tokens.append({"st":repr(val - (1 << 32) if name == "literal" and val >= (1 << 31) else val), "keys":[repr(val)], "kind":1})
   # show a smaller view for repeated instructions in the graph
   lines:list[str] = []
   disasm = {pc:str(inst) for pc,inst in pc_table.items()}
